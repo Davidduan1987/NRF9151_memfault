@@ -1,0 +1,64 @@
+/*
+ * Copyright (c) 2025 Nordic Semiconductor ASA
+ *
+ * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+ */
+
+/ {
+	chosen {
+		ncs,sm-uart = &uart30;
+	};
+};
+
+/* Shell UART */
+&uart20 {
+	current-speed = <115200>;
+	status = "okay";
+};
+
+/* Serial Modem AT Client Shell <-> Serial Modem UART */
+/* Note: Disable VCOM0 from Board Configurator to release UART30 for SM. */
+&uart30 {
+	compatible = "nordic,nrf-uarte";
+	current-speed = <115200>;
+	status = "okay";
+	hw-flow-control;
+};
+
+/* DTR gpios for uart30 */
+/ {
+	dte_dtr: dte_dtr {
+		compatible = "nordic,dte-dtr";
+		dtr-gpios = <&gpio1 11 GPIO_ACTIVE_LOW>;
+		ri-gpios = <&gpio1 12 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+	};
+};
+
+
+/*
+ * Flash partition layout for nRF54L15 DK
+ *
+ * 0x0000_0000  slot0 (primary app)          (1492 kB)
+ * 0x0017_5000  Non-secure storage           ( 32 kB)
+ */
+
+/delete-node/ &boot_partition;
+/delete-node/ &slot0_partition;
+/delete-node/ &slot1_partition;
+/delete-node/ &storage_partition;
+
+&cpuapp_rram {
+	partitions {
+		slot0_partition: partition@0 {
+			compatible = "zephyr,mapped-partition";
+			label = "image-0";
+			reg = <0x0 DT_SIZE_K(1492)>;
+		};
+
+		storage_partition: partition@175000 {
+			compatible = "zephyr,mapped-partition";
+			label = "storage";
+			reg = <0x000175000 DT_SIZE_K(32)>;
+		};
+	};
+};

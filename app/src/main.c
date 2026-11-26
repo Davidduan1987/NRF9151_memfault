@@ -1,0 +1,369 @@
+/*
+ * Copyright (c) 2019 Nordic Semiconductor ASA
+ *
+ * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+ */
+#include <zephyr/logging/log.h>
+#include <zephyr/kernel.h>
+#include <nrf_modem.h>
+#include <hal/nrf_power.h>
+#include <modem/nrf_modem_lib.h>
+#include <zephyr/dfu/mcuboot.h>
+#include <dfu/dfu_target.h>
+#include <zephyr/sys/reboot.h>
+#include <zephyr/logging/log_ctrl.h>
+#include <net/fota_download.h>
+#if defined(CONFIG_MEMFAULT)
+#include <memfault/core/trace_event.h>
+#endif /* CONFIG_MEMFAULT */
+#include "sm_at_host.h"
+#include "sm_at_dfu.h"
+#include "sm_at_fota.h"
+#include "sm_settings.h"
+#include "sm_util.h"
+#include "sm_ctrl_pin.h"
+#include "sm_uart_handler.h"
+#include "sm_log.h"
+#if defined(CONFIG_SM_PC_MODEM_TRACE_UPLOAD)
+#include "sm_pc_trace.h"
+#endif
+
+LOG_MODULE_REGISTER(sm, CONFIG_SM_LOG_LEVEL);
+
+struct k_work_q sm_work_q;
+#if defined(CONFIG_SM_BLOCKING_WORK_Q)
+struct k_work_q sm_blocking_work_q;
+K_THREAD_STACK_DEFINE(sm_blocking_work_q_stack, CONFIG_SM_BLOCKING_WORK_Q_STACK_SIZE);
+#endif
+bool sm_init_failed = false;
+uint8_t sm_modem_init_eio_retry_count;
+
+/* Increase if periodic -EIO false positives are observed in the field. */
+#define SM_MODEM_INIT_EIO_MAX_RETRIES 1
+
+NRF_MODEM_LIB_ON_INIT(lwm2m_init_hook, on_modem_lib_init, NULL);
+NRF_MODEM_LIB_ON_DFU_RES(main_dfu_hook, on_modem_dfu_res, NULL);
+
+static void on_modem_lib_init(int ret, void *ctx)
+{
+	ARG_UNUSED(ctx);
+
+	/** ret: Zero on success, a positive value @em nrf_modem_dfu when executing
+	 *  Modem firmware updates, and negative errno on other failures.
+	 */
+	LOG_INF("lib_modem init: %d", ret);
+}
+
+#if defined(CONFIG_NRF_MODEM_LIB_ON_FAULT_APPLICATION_SPECIFIC)
+static struct nrf_modem_fault_info modem_fault_info;
+
+static void on_modem_failure(struct k_work *)
+{
+	int ret;
+	struct modem_pipe *pipe = sm_at_host_get_urc_pipe();
+#if defined(CONFIG_SM_PC_MODEM_TRACE_UPLOAD)
+	bool capture_fault = sm_pc_trace_prepare_modem_fault();
+#endif
+
+#if defined(CONFIG_MEMFAULT)
+	/* Record the modem fault as a Memfault trace event */
+	MEMFAULT_TRACE_EVENT_WITH_LOG(modem_fault, "Modem fault: reason=0x%x pc=0x%x",
+				      modem_fault_info.reason, modem_fault_info.program_counter);
+#endif /* CONFIG_MEMFAULT */
+	urc_send_to(pipe, "\r\n#XMODEM: FAULT,0x%x,0x%x\r\n", modem_fault_info.reason,
+		    modem_fault_info.program_counter);
+
+	ret = nrf_modem_lib_shutdown();
+	urc_send_to(pipe, "\r\n#XMODEM: SHUTDOWN,%d\r\n", ret);
+
+	ret = nrf_modem_lib_init();
+	urc_send_to(pipe, "\r\n#XMODEM: INIT,%d\r\n", ret);
+#if defined(CONFIG_SM_PC_MODEM_TRACE_UPLOAD)
+	if (capture_fault) {
+		sm_pc_trace_finish_modem_fault(ret);
+	}
+#endif
+}
+K_WORK_DEFINE(modem_failure_work, on_modem_failure);
+
+void nrf_modem_fault_handler(struct nrf_modem_fault_info *fault_info)
+{
+	modem_fault_info = *fault_info;
+
+	k_work_submit_to_queue(&sm_work_q, &modem_failure_work);
+}
+#endif /* CONFIG_NRF_MODEM_LIB_ON_FAULT_APPLICATION_SPECIFIC */
+
+static void on_modem_dfu_res(int dfu_res, void *ctx)
+{
+	switch (dfu_res) {
+	case NRF_MODEM_DFU_RESULT_OK:
+		LOG_INF("Modem update OK, running new firmware");
+		break;
+	case NRF_MODEM_DFU_RESULT_UUID_ERROR:
+	case NRF_MODEM_DFU_RESULT_AUTH_ERROR:
+		LOG_ERR("Modem update failed: 0x%x, running old firmware", dfu_res);
+		break;
+	case NRF_MODEM_DFU_RESULT_HARDWARE_ERROR:
+	case NRF_MODEM_DFU_RESULT_INTERNAL_ERROR:
+		LOG_ERR("Fatal modem update error: 0x%x", dfu_res);
+		break;
+	case NRF_MODEM_DFU_RESULT_VOLTAGE_LOW:
+		LOG_ERR("Modem update postponed, low voltage");
+		break;
+	default:
+		LOG_ERR("Unhandled DFU result: 0x%x", dfu_res);
+		break;
+	}
+
+	/* Update FOTA state only if a modem delta FOTA was in progress.
+	 * sm_fota_type is loaded from NVS; NONE means DFU or no update.
+	 */
+	if (sm_fota_type != SM_FOTA_TYPE_MFW) {
+		return;
+	}
+
+	sm_fota_stage  = (dfu_res == NRF_MODEM_DFU_RESULT_VOLTAGE_LOW)
+			? FOTA_STAGE_ACTIVATE : FOTA_STAGE_COMPLETE;
+	sm_fota_status = (dfu_res == NRF_MODEM_DFU_RESULT_OK)
+			? FOTA_STATUS_OK : FOTA_STATUS_ERROR;
+	sm_fota_info   = (dfu_res == NRF_MODEM_DFU_RESULT_OK) ? 0 : dfu_res;
+}
+
+static void check_app_fota_status(void)
+{
+	/** When a TEST image is swapped to primary partition and booted by MCUBOOT,
+	 * the API mcuboot_swap_type() will return BOOT_SWAP_TYPE_REVERT. By this type
+	 * MCUBOOT means that the TEST image is booted OK and, if it's not confirmed
+	 * next, it'll be swapped back to secondary partition and original application
+	 * image will be restored to the primary partition (so-called Revert).
+	 */
+	const int type = mcuboot_swap_type();
+	int ret = 0;
+
+	switch (type) {
+	/** Attempt to boot the contents of slot 0. */
+	case BOOT_SWAP_TYPE_NONE:
+		/* Normal boot, nothing happened, do nothing. */
+		return;
+	/** Swap to slot 1. Absent a confirm command, revert back on next boot. */
+	case BOOT_SWAP_TYPE_TEST:
+	/** Swap to slot 1, and permanently switch to booting its contents. */
+	case BOOT_SWAP_TYPE_PERM:
+	/** Swap failed because image to be run is not valid. */
+	case BOOT_SWAP_TYPE_FAIL:
+		break;
+	/** Swap back to alternate slot. A confirm changes this state to NONE. */
+	case BOOT_SWAP_TYPE_REVERT:
+		/* Happens on a successful application FOTA.
+		 * boot_write_img_confirmed() resolves the flash area via
+		 * slot_0_partition. It writes image_ok where MCUboot expects it.
+		 */
+		ret = boot_write_img_confirmed_multi(0);
+		LOG_INF("Image confirmed: %d", ret);
+		break;
+	}
+	/* Only report FOTA completion if an app FOTA was in progress.
+	 * sm_fota_type is loaded from NVS; NONE means DFU or no update.
+	 */
+	if (sm_fota_type != SM_FOTA_TYPE_APP) {
+		return;
+	}
+	sm_fota_status = (type == BOOT_SWAP_TYPE_REVERT && ret == 0)
+			? FOTA_STATUS_OK : FOTA_STATUS_ERROR;
+	sm_fota_info   = (type == BOOT_SWAP_TYPE_REVERT) ? ret : type;
+	sm_fota_stage  = FOTA_STAGE_COMPLETE;
+}
+
+static int bootloader_mode_init(void)
+{
+	int ret;
+
+	ret = nrf_modem_lib_bootloader_init();
+	if (ret) {
+		LOG_ERR("Failed to initialize bootloader mode: %d", ret);
+		return ret;
+	}
+	LOG_INF("Bootloader mode active");
+
+	urc_send("Bootloader mode ready\r\n");
+
+	sm_bootloader_mode_enabled = true;
+
+	return 0;
+}
+
+void lte_auto_connect(void)
+{
+#if defined(CONFIG_SM_AUTO_CONNECT)
+	int err;
+	int n;
+	int stat;
+
+	err = sm_util_at_scanf("AT+CEREG?", "+CEREG: %d,%d", &n, &stat);
+	if (err != 2 || (stat == 1 || stat == 5)) {
+		return;
+	}
+
+	LOG_INF("LTE auto connect");
+	err = sm_util_at_printf("AT%%XSYSTEMMODE=%s", CONFIG_SM_AUTO_CONNECT_SYSTEM_MODE);
+	if (err) {
+		LOG_ERR("System mode %s: %d", CONFIG_SM_AUTO_CONNECT_SYSTEM_MODE, err);
+		return;
+	}
+
+#if defined(CONFIG_SM_AUTO_CONNECT_PDN_CONFIG)
+	err = sm_util_at_printf("AT+CGDCONT=0,%s,%s", CONFIG_SM_AUTO_CONNECT_PDN_FAMILY_STRING,
+				CONFIG_SM_AUTO_CONNECT_PDN_APN);
+	if (err) {
+		LOG_ERR("PDN APN config failed: %d", err);
+		return;
+	}
+
+	if (CONFIG_SM_AUTO_CONNECT_PDN_AUTH != 0) {
+		err = sm_util_at_printf("AT+CGAUTH=0,%d,%s,%s", CONFIG_SM_AUTO_CONNECT_PDN_AUTH,
+					CONFIG_SM_AUTO_CONNECT_PDN_USERNAME,
+					CONFIG_SM_AUTO_CONNECT_PDN_PASSWORD);
+		if (err) {
+			LOG_ERR("PDN auth config failed: %d", err);
+			return;
+		}
+	}
+#endif /* CONFIG_SM_AUTO_CONNECT_PDN_CONFIG */
+
+	err = sm_util_at_printf("AT+CFUN=1");
+	if (err) {
+		LOG_ERR("Failed to turn on radio: %d", err);
+		return;
+	}
+
+#endif /* CONFIG_SM_AUTO_CONNECT */
+}
+
+static int init_sm_work_q(void)
+{
+	k_work_queue_init(&sm_work_q);
+#if defined(CONFIG_SM_BLOCKING_WORK_Q)
+	k_work_queue_init(&sm_blocking_work_q);
+#endif
+	return 0;
+}
+SYS_INIT(init_sm_work_q, PRE_KERNEL_1, 0);
+
+int main(void)
+{
+	static const struct k_work_queue_config cfg = {
+		.name = "sm_work_q",
+		.essential = true,
+	};
+#if defined(CONFIG_SM_BLOCKING_WORK_Q)
+	static const struct k_work_queue_config blocking_cfg = {
+		.name = "sm_blocking_wq",
+	};
+
+	k_work_queue_start(&sm_blocking_work_q, sm_blocking_work_q_stack,
+			   K_THREAD_STACK_SIZEOF(sm_blocking_work_q_stack),
+			   K_LOWEST_APPLICATION_THREAD_PRIO, &blocking_cfg);
+#endif
+
+	k_thread_priority_set(k_current_get(), K_LOWEST_APPLICATION_THREAD_PRIO);
+	k_work_queue_run(&sm_work_q, &cfg);
+	return 0;
+}
+
+static int sm_main(void)
+{
+	int ret;
+
+	const uint32_t rr = nrf_power_resetreas_get(NRF_POWER_NS);
+
+	nrf_power_resetreas_clear(NRF_POWER_NS, 0x70017);
+	LOG_INF("Reset reason: 0x%08x", rr);
+
+	if (sm_bootloader_mode_requested) {
+		/* Clear bootloader mode flag */
+		ret = bootloader_mode_request(false);
+		if (ret) {
+			LOG_ERR("Bootloader mode flag clear failed, starting in normal mode");
+		} else {
+			ret = bootloader_mode_init();
+			if (ret) {
+				LOG_ERR("Failed to initialize bootloader mode: %d", ret);
+				goto exit_reboot;
+			}
+			return ret;
+		}
+	}
+
+#if defined(CONFIG_SM_FULL_FOTA)
+	if (sm_fota_type == SM_FOTA_TYPE_FULL_MFW) {
+		sm_finish_modem_full_fota();
+	}
+#endif
+
+	ret = nrf_modem_lib_init();
+
+	if (ret) {
+		LOG_ERR("Modem library init failed: %d", ret);
+		if (ret != -EAGAIN && ret != -EIO) {
+			return ret;
+		} else if (ret == -EIO) {
+			if (sm_modem_init_eio_retry_count < SM_MODEM_INIT_EIO_MAX_RETRIES) {
+				/* -EIO has been observed as a false positive when reset occurs
+				 * during a flash operation.
+				 */
+				sm_modem_init_eio_retry_count++;
+				LOG_WRN("Rebooting %u/%u, requesting bootloader mode",
+					sm_modem_init_eio_retry_count,
+					SM_MODEM_INIT_EIO_MAX_RETRIES);
+				(void)sm_settings_modem_eio_retried_save();
+				goto exit_reboot;
+			}
+
+			sm_modem_init_eio_retry_count = 0;
+			(void)sm_settings_modem_eio_retried_save();
+
+			LOG_ERR("Full modem firmware update required");
+			(void)bootloader_mode_request(true);
+			goto exit_reboot;
+		}
+	} else if (sm_modem_init_eio_retry_count != 0) {
+		/* Recovered on its own after the reboot(s) above: clear the retry count so a
+		 * later, unrelated -EIO is not immediately escalated to bootloader mode.
+		 */
+		sm_modem_init_eio_retry_count = 0;
+		(void)sm_settings_modem_eio_retried_save();
+	}
+
+	sm_fota_mcuboot_bl_boot_check();
+
+	check_app_fota_status();
+
+	if (sm_init_failed) {
+		urc_send(SM_SYNC_ERR_STR);
+	} else {
+		urc_send(SM_SYNC_STR);
+	}
+
+	/* This is here and not earlier because in case of firmware
+	 * update it will send an AT response so the UART must be up.
+	 */
+	sm_fota_post_process();
+
+	lte_auto_connect();
+
+	LOG_INF("Serial Modem");
+
+	return ret;
+
+exit_reboot:
+	sm_uart_tx_flush();
+	sm_log_flush();
+	/* sm_log_flush() only hands the last log line to the console UART backend; its
+	 * async TX completion still needs the CPU to run once more before the reboot below
+	 * cuts power, or the log is lost.
+	 */
+	k_sleep(K_MSEC(100));
+	sys_reboot(SYS_REBOOT_COLD);
+}
+SYS_INIT(sm_main, APPLICATION, 100);

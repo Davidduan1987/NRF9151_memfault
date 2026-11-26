@@ -1,0 +1,47 @@
+Release artifacts
+#################
+
+The |SM| repository contains the release artifacts that you can download from the Assets section of the release on the `release page <github_release_>`_.
+The following release artifacts are available:
+
+.. list-table::
+   :widths: auto
+   :header-rows: 1
+
+   * - Release artifact
+     - Description
+   * - ``serial_modem_{VERSION}_nrf9151dk_nrf91m1``
+     - nRF91M1 content for nRF9151 DK.
+   * - ``sm_at_client_shell_{VERSION}_nrf54l15dk``
+     - AT client shell build for nRF54L15 DK host that can be used as an external MCU.
+       See :ref:`uart_configuration` for pin wiring.
+   * - ``sm_ppp_shell_{VERSION}_nrf54l15dk``
+     - PPP shell build for nRF54L15 DK host that can be used as an external MCU.
+       See :ref:`uart_configuration` for pin wiring.
+   * - ``serial_modem_{VERSION}_interposer_nrf9151_mk_bg95_nrf91m1``
+     - Adapts the nRF9151 SiP to the BG95 module footprint through the nRF9151-MK-BG95 interposer, using the nRF91M1 content.
+   * - ``serial_modem_{VERSION}_interposer_nrf9151_mk_gm02s_nrf91m1``
+     - Adapts the nRF9151 SiP to the GM02S module footprint through the nRF9151-MK-GM02S interposer, using the nRF91M1 content.
+
+The artifacts are zipped and contain build files such as:
+
+.. list-table::
+   :widths: auto
+   :header-rows: 1
+
+   * - Release artifact
+     - Description
+   * - ``.hex``
+     - The unsigned application binary (MCUboot + application) to be flashed with Programmer or nRF Util.
+   * - ``.signed.bin``
+     - Signed application only binary to be used in FOTA/DFU.
+   * - ``_dfu_application.zip``
+     - Signed application only binary zipped with metadata used by nRF Cloud for FOTA/DFU.
+   * - ``.elf``
+     - Application image symbols for debugging purposes.
+   * - ``.dts``
+     - Devicetree.
+   * - ``.config``
+     - Application image Kconfig options.
+
+For more details about the build artifacts, see the `build output files`_ documentation.

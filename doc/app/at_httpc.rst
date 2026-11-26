@@ -1,0 +1,577 @@
+.. _SM_AT_HTTPC:
+
+HTTP client AT commands
+***********************
+
+.. contents::
+   :local:
+   :depth: 1
+
+This page describes AT commands for the HTTP client.
+The HTTP client operates on sockets managed by the :ref:`SM_AT_SOCKET`.
+You can perform the following using the Socket AT commands:
+
+* Create a socket with ``AT#XSOCKET`` or ``AT#XSSOCKET``.
+* Connect it with ``AT#XCONNECT``.
+* Set socket options with ``AT#XSOCKETOPT`` or ``AT#XSSOCKETOPT``.
+* Close with ``AT#XCLOSE``.
+
+.. _SM_AT_HTTPC_IDLE_TIMEOUT:
+
+.. rubric:: Request idle timeout
+
+.. only:: not nrf91m1
+
+   Every active HTTP request has a sliding idle timeout controlled by the :ref:`CONFIG_SM_HTTPC_RESPONSE_TIMEOUT_MS <CONFIG_SM_HTTPC_RESPONSE_TIMEOUT_MS>` Kconfig option (default 30 seconds).
+
+.. only:: nrf91m1
+
+   Every active HTTP request has a sliding idle timeout of 30 seconds.
+
+The timer resets each time data is sent or received:
+
+* Sending request headers or body upload chunks (POST/PUT data mode).
+* Receiving response headers or body bytes.
+* Pulling a body chunk in manual mode (``AT#XHTTPCDATA``).
+
+If no such activity occurs within the configured window, the request is aborted and ``#XHTTPCSTAT: <handle>,-1,<total_bytes>,<connection_close>`` is emitted.
+The timeout is enforced by a background timer that fires independently of normal socket poll events, so a server that stalls silently (no TCP RST or FIN) is also detected.
+
+HTTP request #XHTTPCREQ
+=======================
+
+The ``#XHTTPCREQ`` command starts an asynchronous HTTP or HTTPS request on a socket connected with ``AT#XCONNECT``.
+
+Set command
+-----------
+
+The set command starts an HTTP or HTTPS request.
+
+Syntax
+~~~~~~
+
+::
+
+   AT#XHTTPCREQ=<handle>,<url>,<method>[,<auto_reception>[,<format>[,<body_len>[,<header 1>[,<header 2>[...]]]]]]
+
+The parameters and their defined values are the following:
+
+<handle>
+   Integer.
+   Identifies the connected socket handle returned by ``AT#XSOCKET`` or ``AT#XSSOCKET``, and connected by ``AT#XCONNECT``.
+
+<url>
+   String.
+   The full URL of the request, for example, ``http://host/path`` or ``https://host/path``.
+
+<method>
+   * ``0`` - GET.
+   * ``1`` - POST.
+   * ``2`` - PUT.
+   * ``3`` - DELETE.
+   * ``4`` - HEAD.
+
+<auto_reception>
+   Integer.
+   Optional.
+   When omitted, automatic reception is used.
+
+   * ``1`` - Automatic mode (default).
+     Response body bytes are received and forwarded to the host automatically.
+   * ``0`` - Manual mode.
+     Response body reception is paused after the headers are parsed and ``#XHTTPCHEAD`` is emitted.
+     The host must then retrieve body data in chunks using ``AT#XHTTPCDATA`` commands.
+
+<format>
+   Integer.
+   Optional.
+   Controls the encoding used to deliver response body bytes to the host.
+
+   * ``0`` - Binary (default).
+     Response body bytes are forwarded to the host as raw binary.
+   * ``1`` - Hex string.
+     Response body bytes are encoded as a lower-case ASCII hex string before delivery.
+     Each raw byte becomes two hex characters.
+     The ``<length>`` field in ``#XHTTPCDATA`` always reports the raw byte count.
+     The actual data delivered is ``2×<length>`` ASCII hex characters.
+     Applies to both automatic and manual reception modes.
+
+<body_len>
+   Integer.
+   Optional.
+   Required as a placeholder when ``<header>`` parameters follow.
+
+   * ``0`` - No request body.
+   * Positive integer - Length of the request body in bytes.
+     Valid for POST and PUT only.
+     When set, the HTTP request headers are sent to the server immediately when the AT command is processed.
+     The command then responds with ``OK`` and enters data mode.
+     Body bytes are forwarded to the server as they are received from the host in data mode.
+     The host must send exactly this many bytes as the request body.
+     Data mode exits and ``#XDATAMODE: 0`` is reported when all bytes have been processed.
+
+<header X>
+   String.
+   Optional.
+   An additional HTTP request header.
+   Empty parameters between headers (``<header 1>``, ``<header 2>``,, ``<header 3>``, ...) are ignored.
+
+.. note::
+
+   The HTTP client uses HTTP/1.1 and relies on the protocol default of persistent (keep-alive)
+   connections.
+   Multiple sequential requests can therefore be made on the same connected socket without
+   reconnecting.
+   To close the connection after a response, pass ``"Connection: close"`` as a custom header.
+
+Response syntax
+~~~~~~~~~~~~~~~
+
+::
+
+   #XHTTPCREQ: <handle>
+   OK
+
+The parameters and their defined values are the following:
+
+<handle>
+   Integer.
+   Identifies the socket.
+
+Unsolicited notification
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+``#XHTTPCHEAD`` is emitted when response headers have been parsed::
+
+   #XHTTPCHEAD: <handle>,<status_code>,<content_length>
+
+The parameters and their defined values are the following:
+
+<handle>
+   Integer.
+   Identifies the socket.
+
+<status_code>
+   Integer.
+   The HTTP status code returned by the server.
+
+<content_length>
+   Integer.
+   The value of the ``Content-Length`` response header, or ``-1`` when the server uses chunked transfer encoding or does not provide a content length.
+
+``#XHTTPCDATA`` is emitted in automatic mode for each received body chunk::
+
+   #XHTTPCDATA: <handle>,<offset>,<length>
+   <data>
+
+The notification line is terminated with ``\r\n``, the response data follows immediately, and a ``\r\n`` terminator follows the data bytes.
+In binary mode (``<format>=0``, default),  the data is ``<length>`` raw bytes.
+In hex mode (``<format>=1``), the data is ``2×<length>`` lower-case ASCII hex characters.
+
+The parameters and their defined values are the following:
+
+<handle>
+   Integer.
+   Identifies the socket.
+
+<offset>
+   Integer.
+   The number of body bytes already delivered before this chunk.
+
+<length>
+   Integer.
+   The number of body bytes in this chunk.
+
+.. note::
+
+   When the server uses ``Transfer-Encoding: chunked``, the body bytes delivered via ``#XHTTPCDATA`` include the raw chunked framing.
+   Each chunk consists of a size line (hexadecimal length followed by ``\r\n``), the chunk data, and a trailing ``\r\n``.
+   The final zero-length chunk ``0\r\n\r\n`` is also forwarded.
+   The host strips this framing to recover the original body content.
+   The ``<total_bytes>`` field in ``#XHTTPCSTAT`` reflects the raw wire byte count, including chunked framing, not the decoded body length.
+
+``#XHTTPCSTAT`` is emitted when the request completes, fails, or is cancelled::
+
+   #XHTTPCSTAT: <handle>,<status_code>,<total_bytes>,<connection_close>
+
+The parameters and their defined values are the following:
+
+<handle>
+   Integer.
+   Identifies the socket.
+
+<status_code>
+   Integer.
+   The HTTP status code on success, or ``-1`` on failure, cancel, or timeout.
+
+<total_bytes>
+   Integer.
+   On successful completion, failure, or timeout, it contains the total number of response body bytes received by the HTTP client.
+   For chunked transfer encoding this includes the raw framing bytes (chunk-size lines, ``\r\n`` separators, and the final ``0\r\n\r\n`` terminator).
+   On cancel (``status_code=-1`` from ``AT#XHTTPCCANCEL`` or ``AT#XCLOSE``), or timeout, it contains the number of response body bytes already delivered to the host.
+
+<connection_close>
+   * ``0`` - Keep-alive connection.
+   * ``1`` - The server includes a ``Connection: close`` header, indicating that the TCP connection will be closed after this response.
+     The host must close the socket with ``AT#XCLOSE`` and open a new connection before issuing the next request.
+
+.. note::
+
+   For responses that carry no body by definition — ``HEAD`` requests, ``1xx``,
+   ``204 No Content``, and ``304 Not Modified`` — ``#XHTTPCHEAD`` is emitted immediately
+   followed by ``#XHTTPCSTAT``.  No ``#XHTTPCDATA`` notification is generated.
+
+Examples
+~~~~~~~~
+
+The following examples demonstrate how to perform an HTTP GET request and receive the response in automatic or manual mode on a connected socket.
+
+HTTP GET (automatic mode):
+
+::
+
+   AT#XHTTPCREQ=0,<url>,0
+   #XHTTPCREQ: 0
+   OK
+
+   #XHTTPCHEAD: 0,200,261
+
+   #XHTTPCDATA: 0,0,261
+   <261 bytes>
+
+   #XHTTPCSTAT: 0,200,261,0
+
+.. note::
+
+   In automatic mode, a ``\r\n`` terminator is appended after the data bytes of each ``#XHTTPCDATA`` notification.
+
+HTTP GET (manual mode):
+
+::
+
+   AT#XHTTPCREQ=0,<url>,0,0
+   #XHTTPCREQ: 0
+   OK
+
+   #XHTTPCHEAD: 0,200,261
+
+   AT#XHTTPCDATA=0
+   #XHTTPCDATA: 0,0,261
+   <261 bytes>
+   OK
+
+   #XHTTPCSTAT: 0,200,261,0
+
+HTTP GET with hex-encoded response body (``format=1``, automatic mode):
+
+::
+
+   AT#XHTTPCREQ=0,<url>,0,1,1
+   #XHTTPCREQ: 0
+   OK
+
+   #XHTTPCHEAD: 0,200,12
+
+   #XHTTPCDATA: 0,0,12
+   48656c6c6f20576f726c6421
+
+   #XHTTPCSTAT: 0,200,12,0
+
+The hex string and the line break after it represent the ``2×<length>`` hex characters followed by the ``\r\n`` terminator.
+
+HTTP POST with JSON body and custom header:
+
+::
+
+   AT#XHTTPCREQ=0,<url>,1,1,0,15,"Content-Type: application/json"
+   #XHTTPCREQ: 0
+   OK
+   {"key":"value"}
+   #XDATAMODE: 0
+
+   #XHTTPCHEAD: 0,200,432
+
+   #XHTTPCDATA: 0,0,432
+   <432 bytes>
+
+   #XHTTPCSTAT: 0,200,432,0
+
+HTTP GET data in binary format with Range header (``body_len=0`` is required as a placeholder when ``<header>`` parameters follow):
+
+In this example the server returns ``connection_close=1``, so the host must close and reopen the socket before the next request.
+
+::
+
+   AT#XHTTPCREQ=0,<url>,0,1,0,0,"Range: bytes=0-127"
+   #XHTTPCREQ: 0
+   OK
+
+   #XHTTPCHEAD: 0,206,128
+
+   #XHTTPCDATA: 0,0,128
+   <128 bytes>
+
+   #XHTTPCSTAT: 0,206,128,0
+
+   AT#XHTTPCREQ=0,<url>,0,1,0,0,"Range: bytes=128-255"
+   #XHTTPCREQ: 0
+   OK
+
+   #XHTTPCHEAD: 0,206,128
+
+   #XHTTPCDATA: 0,0,128
+   <128 bytes>
+
+   #XHTTPCSTAT: 0,206,128,1
+
+   AT#XCLOSE=0
+   #XCLOSE: 0,0
+   OK
+
+HTTP HEAD (no body — ``#XHTTPCSTAT`` follows immediately after ``#XHTTPCHEAD``):
+
+::
+
+   AT#XHTTPCREQ=0,<url>,4
+   #XHTTPCREQ: 0
+   OK
+
+   #XHTTPCHEAD: 0,200,261
+
+   #XHTTPCSTAT: 0,200,0,0
+
+HTTP POST with chunked response (``content_length=-1``):
+
+::
+
+   AT#XHTTPCREQ=0,<url>,1,1,0,1024
+   #XHTTPCREQ: 0
+   OK
+   <1024 bytes payload>
+   #XDATAMODE: 0
+
+   #XHTTPCHEAD: 0,200,-1
+
+   #XHTTPCDATA: 0,0,1132
+   460\r\n{"args":{},"data":"<1024 bytes>","url":"..."}\r\n0\r\n\r\n
+
+   #XHTTPCSTAT: 0,200,1132,0
+
+.. note::
+
+   The 1132 raw bytes break down as chunked framing: ``460\r\n`` (chunk-size 1120 decimal in hex, 5 bytes), 1120 bytes of JSON body, ``\r\n`` (chunk trailer, 2 bytes), and ``0\r\n\r\n`` (final zero-length chunk, 5 bytes).
+   Strip this framing to recover the 1120-byte JSON body.
+
+Test command
+------------
+
+The test command tests the existence of the command and provides information about the type of its subparameters.
+
+Syntax
+~~~~~~
+
+::
+
+   AT#XHTTPCREQ=?
+
+Response syntax
+~~~~~~~~~~~~~~~
+
+::
+
+   #XHTTPCREQ: <handle>,<url>,<method>[,<auto_reception>[,<format>[,<body_len>[,<header>]...]]]
+
+Example
+~~~~~~~
+
+::
+
+   AT#XHTTPCREQ=?
+   #XHTTPCREQ: <handle>,<url>,<method>[,<auto_reception>[,<format>[,<body_len>[,<header>]...]]]
+   OK
+
+HTTP data pull #XHTTPCDATA
+==========================
+
+The ``#XHTTPCDATA`` command pulls the next body chunk for a manual-mode HTTP request.
+
+Set command
+-----------
+
+The set command performs one non-blocking receive on the socket of a manual-mode request and forwards the available data to the host.
+
+Syntax
+~~~~~~
+
+::
+
+   AT#XHTTPCDATA=<handle>[,<length>]
+
+The parameters and their defined values are the following:
+
+<handle>
+   Integer.
+   Identifies the socket used when starting the manual-mode request.
+
+<length>
+   Integer.
+   Optional.
+   The maximum number of bytes to receive in this pull.
+   When omitted, the full internal receive buffer size is used.
+
+Response syntax
+~~~~~~~~~~~~~~~
+
+When body data is available::
+
+   #XHTTPCDATA: <handle>,<offset>,<length>
+   <length bytes of raw body data>
+   OK
+
+The ``#XHTTPCDATA:`` line is terminated with ``\r\n``.
+``<length>`` raw body bytes follow immediately with no additional separator.
+``OK`` follows on its own line after the body bytes.
+
+When the socket buffer is temporarily empty (EAGAIN)::
+
+   #XHTTPCDATA: <handle>,<offset>,0
+   OK
+
+The parameters and their defined values are the following:
+
+<handle>
+   Integer.
+   Identifies the socket.
+
+<offset>
+   Integer.
+   The number of body bytes already delivered before this pull.
+
+<length>
+   Integer.
+   The number of body bytes delivered in this pull.
+   A value of ``0`` means the socket buffer is currently empty.
+
+When all body bytes have been delivered, ``#XHTTPCSTAT`` is sent as a URC after the final ``OK``.
+This happens either when the server closes the connection, when the ``Content-Length`` bytes have all been forwarded, or when the chunked transfer ``0\r\n\r\n`` terminator is received.
+
+.. note::
+
+   When the server uses ``Transfer-Encoding: chunked`` (``content_length=-1`` in ``#XHTTPCHEAD``), the bytes returned by ``#XHTTPCDATA`` include raw chunked framing.
+   See the note under ``#XHTTPCDATA`` in the ``AT#XHTTPCREQ`` section.
+
+.. note::
+
+   Retry the pull after a brief delay when ``#XHTTPCDATA: <handle>,<offset>,0`` is received.
+   Use ``AT#XHTTPCCANCEL=<handle>`` to cancel if no more data is needed.
+
+Example
+~~~~~~~
+
+::
+
+   AT#XHTTPCDATA=0,256
+   #XHTTPCDATA: 0,0,256
+   <256 bytes>
+   OK
+
+   AT#XHTTPCDATA=0,256
+   #XHTTPCDATA: 0,256,256
+   <256 bytes>
+   OK
+
+   #XHTTPCSTAT: 0,200,512,0
+
+Test command
+------------
+
+The test command tests the existence of the command and provides information about the type of its subparameters.
+
+Syntax
+~~~~~~
+
+::
+
+   AT#XHTTPCDATA=?
+
+Response syntax
+~~~~~~~~~~~~~~~
+
+::
+
+   #XHTTPCDATA: <handle>[,<length>]
+
+Example
+~~~~~~~
+
+::
+
+   AT#XHTTPCDATA=?
+   #XHTTPCDATA: <handle>[,<length>]
+   OK
+
+HTTP request cancel #XHTTPCCANCEL
+=================================
+
+The ``#XHTTPCCANCEL`` command cancels an active HTTP request.
+
+Set command
+-----------
+
+The set command cancels an active request.
+
+Syntax
+~~~~~~
+
+::
+
+   AT#XHTTPCCANCEL=<handle>
+
+The parameters and their defined values are the following:
+
+<handle>
+   Integer.
+   Identifies the socket of the request to cancel.
+
+An unsolicited ``#XHTTPCSTAT: <handle>,-1,<total_bytes>,<connection_close>`` notification is emitted after cancellation, where ``<total_bytes>`` is the number of response body bytes already delivered to the host.
+
+.. note::
+
+   Closing the socket with ``AT#XCLOSE`` while a request is active also cancels the request and emits ``#XHTTPCSTAT: <handle>,-1,<total_bytes>,<connection_close>`` before the socket is freed.
+
+Example
+~~~~~~~
+
+::
+
+   AT#XHTTPCCANCEL=0
+   OK
+   #XHTTPCSTAT: 0,-1,0,0
+
+Test command
+------------
+
+The test command tests the existence of the command and provides information about the type of its subparameters.
+
+Syntax
+~~~~~~
+
+::
+
+   AT#XHTTPCCANCEL=?
+
+Response syntax
+~~~~~~~~~~~~~~~
+
+::
+
+   #XHTTPCCANCEL: <handle>
+
+Example
+~~~~~~~
+
+::
+
+   AT#XHTTPCCANCEL=?
+   #XHTTPCCANCEL: <handle>
+   OK

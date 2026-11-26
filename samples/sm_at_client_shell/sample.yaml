@@ -1,0 +1,9 @@
+sample:
+  description: Serial Modem Shell sample
+  name: SM shell
+tests:
+  sample.sm_at_client_shell:
+    sysbuild: true
+    build_only: true
+    platform_allow:
+      - nrf54l15dk/nrf54l15/cpuapp

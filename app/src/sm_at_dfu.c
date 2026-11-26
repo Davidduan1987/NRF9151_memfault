@@ -1,0 +1,730 @@
+/*
+ * Copyright (c) 2025 Nordic Semiconductor ASA
+ *
+ * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+ */
+
+#include <stdbool.h>
+#include <stdint.h>
+#include <errno.h>
+#include <zephyr/kernel.h>
+#include <zephyr/sys/reboot.h>
+#include <zephyr/logging/log.h>
+#include <zephyr/logging/log_ctrl.h>
+#include <zephyr/storage/flash_map.h>
+#include <modem/nrf_modem_lib.h>
+#include <nrf_modem_bootloader.h>
+#include <dfu/dfu_target.h>
+#include <dfu/dfu_target_modem_delta.h>
+#include <dfu/dfu_target_mcuboot.h>
+#include "sm_util.h"
+#include "sm_at_host.h"
+#include "sm_at_dfu.h"
+#include "sm_settings.h"
+#include "sm_uart_handler.h"
+#include "sm_log.h"
+#if defined(CONFIG_SM_PC_MODEM_TRACE_UPLOAD)
+#include "sm_pc_trace.h"
+#endif
+
+LOG_MODULE_REGISTER(sm_dfu, CONFIG_SM_LOG_LEVEL);
+
+#define APP_DFU_BUFFER_SIZE 1024
+
+#if FIXED_PARTITION_EXISTS(s1_partition)
+#define SM_DFU_BL_SUPPORTED
+#endif
+
+enum xdfu_image_type {
+	DFU_TYPE_APP = 0,
+	DFU_TYPE_DELTA_MFW = 1,
+	DFU_TYPE_FULL_MFW = 2,
+#if defined(SM_DFU_BL_SUPPORTED)
+	/* Banked MCUboot self-update; host must use inactive-slot signed image */
+	DFU_TYPE_MCUBOOT_BL = 3,
+#endif
+};
+
+enum xdfu_full_mfw_segment_type {
+	DFU_FULL_MFW_SEGMENT_BOOTLOADER = 0,
+	DFU_FULL_MFW_SEGMENT_FIRMWARE = 1,
+};
+
+enum xdfu_operation {
+	DFU_OPERATION_INITIALIZE = 0,
+	DFU_OPERATION_DATA_WRITE = 1,
+	DFU_OPERATION_APPLY_UPDATE = 2,
+};
+struct xdfu_app_datamode_context {
+	size_t addr;
+	size_t len;
+} xdfu_app_datamode_context;
+
+struct xdfu_delta_mfw_datamode_context {
+	size_t addr;
+	size_t len;
+} xdfu_delta_mfw_datamode_context;
+
+struct xdfu_full_mfw_datamode_context {
+	size_t addr;
+	size_t len;
+} xdfu_full_mfw_datamode_context;
+
+bool sm_bootloader_mode_requested;
+bool sm_bootloader_mode_enabled;
+
+int full_mfw_dfu_segment_type = DFU_FULL_MFW_SEGMENT_BOOTLOADER;
+
+static uint8_t app_dfu_buffer[APP_DFU_BUFFER_SIZE] __aligned(4);
+static bool app_dfu_buffer_initialized;
+#if defined(CONFIG_SM_PC_MODEM_TRACE_UPLOAD)
+static bool pc_trace_dfu_busy;
+
+bool sm_pc_trace_dfu_busy(void)
+{
+	return pc_trace_dfu_busy;
+}
+#endif
+
+static enum xdfu_image_type xdfu_current_image_type;
+static uint32_t xdfu_bytes_written;
+static int xdfu_status;
+
+static void delta_dfu_evt_handler(enum dfu_target_evt_id evt_id)
+{
+	switch (evt_id) {
+	case DFU_TARGET_EVT_ERASE_PENDING:
+		LOG_INF("Delta DFU erase %s", "pending");
+		break;
+	case DFU_TARGET_EVT_TIMEOUT:
+		LOG_WRN("Delta DFU erase %s", "timeout");
+		break;
+	case DFU_TARGET_EVT_ERASE_DONE:
+		LOG_INF("Delta DFU erase %s", "done");
+		break;
+	default:
+		break;
+	}
+}
+
+int bootloader_mode_request(bool enable)
+{
+	int err;
+
+	sm_bootloader_mode_requested = enable;
+
+	err = sm_settings_bootloader_mode_save();
+	if (err) {
+		LOG_ERR("Bootloader mode request save failed: %d", err);
+		return err;
+	}
+
+	LOG_DBG("Bootloader mode request: %s", enable ? "enabled" : "disabled");
+
+	return 0;
+}
+
+static int set_full_mfw_dfu_segment_type(enum xdfu_full_mfw_segment_type type)
+{
+	int err;
+
+	full_mfw_dfu_segment_type = type;
+
+	err = sm_settings_full_mfw_dfu_segment_type_save();
+	if (err) {
+		LOG_ERR("Full MFW DFU segment type save failed: %d", err);
+		return err;
+	}
+
+	LOG_DBG("Full MFW DFU segment type: %d", type);
+
+	return 0;
+}
+
+static int xdfu_datamode_callback(uint8_t op, const uint8_t *data, int len, uint8_t flags)
+{
+	ARG_UNUSED(flags);
+
+	int err;
+
+	switch (op) {
+	case DATAMODE_SEND:
+		if (data == NULL || len <= 0) {
+			LOG_ERR("Chunk data invalid data=%p len=%d", (void *)data, len);
+			return -EINVAL;
+		}
+
+		switch (xdfu_current_image_type) {
+		case DFU_TYPE_APP:
+#if defined(SM_DFU_BL_SUPPORTED)
+		case DFU_TYPE_MCUBOOT_BL:
+#endif
+			err = dfu_target_mcuboot_write((const void *)data, len);
+			if (err) {
+				LOG_ERR("Failed to write %s: %d",
+					xdfu_current_image_type == DFU_TYPE_APP ? "app firmware" :
+						"MCUboot bootloader firmware",
+					err);
+				xdfu_status = err;
+			}
+			break;
+		case DFU_TYPE_DELTA_MFW:
+			err = dfu_target_modem_delta_write((const void *)data, len);
+			if (err) {
+				LOG_ERR("Failed to write %s: %d", "delta modem firmware", err);
+				xdfu_status = err;
+			}
+			break;
+		case DFU_TYPE_FULL_MFW:
+			if (full_mfw_dfu_segment_type == DFU_FULL_MFW_SEGMENT_BOOTLOADER) {
+				err = nrf_modem_bootloader_bl_write((void *)data, len);
+				if (err) {
+					LOG_ERR("Failed to write %s: %d", "bootloader segment", err);
+					xdfu_status = err;
+					break;
+				}
+			} else if (full_mfw_dfu_segment_type == DFU_FULL_MFW_SEGMENT_FIRMWARE) {
+				err = nrf_modem_bootloader_fw_write(
+					xdfu_full_mfw_datamode_context.addr,
+					(void *)data, len);
+				if (err) {
+					LOG_ERR("Failed to write %s: %d", "firmware segment", err);
+					xdfu_status = err;
+					break;
+				}
+
+				xdfu_full_mfw_datamode_context.addr += len;
+			} else {
+				LOG_ERR("Invalid segment type: %d", full_mfw_dfu_segment_type);
+				xdfu_status = -EINVAL;
+				break;
+			}
+			break;
+		default:
+			LOG_ERR("Invalid image type: %d", xdfu_current_image_type);
+			return -EINVAL;
+		}
+
+		if (xdfu_status == 0) {
+			xdfu_bytes_written += len;
+		}
+
+		/* Return the amount of data sent. */
+		return len;
+
+	case DATAMODE_EXIT: {
+		size_t expected_bytes_written;
+
+		switch (xdfu_current_image_type) {
+		case DFU_TYPE_APP:
+#if defined(SM_DFU_BL_SUPPORTED)
+		case DFU_TYPE_MCUBOOT_BL:
+#endif
+			expected_bytes_written = xdfu_app_datamode_context.len;
+			break;
+		case DFU_TYPE_DELTA_MFW:
+			expected_bytes_written = xdfu_delta_mfw_datamode_context.len;
+			break;
+		case DFU_TYPE_FULL_MFW:
+			expected_bytes_written = xdfu_full_mfw_datamode_context.len;
+			break;
+		default:
+			LOG_ERR("Invalid image type: %d", xdfu_current_image_type);
+			xdfu_status = -EINVAL;
+			return -EINVAL;
+		}
+
+		if (xdfu_status == 0 && xdfu_bytes_written != expected_bytes_written) {
+			LOG_WRN("Wrote %u bytes, expected %zu",
+				xdfu_bytes_written, expected_bytes_written);
+			xdfu_status = -EIO;
+		}
+
+		urc_send("#XDFU: %u,%u,%d\r\n",
+			xdfu_current_image_type, DFU_OPERATION_DATA_WRITE,
+			xdfu_status ? -1 : 0);
+
+		/* Reset for next chunk. */
+		xdfu_bytes_written = 0;
+		xdfu_status = 0;
+
+		return 0;
+	}
+	default:
+		LOG_WRN("Unexpected data mode op=%u flags=0x%02x", op, flags);
+		return 0;
+	}
+}
+
+SM_AT_CMD_CUSTOM(xdfu_init, "AT#XDFUINIT", handle_at_xdfu_init);
+static int handle_at_xdfu_init(enum at_parser_cmd_type cmd_type, struct at_parser *parser,
+				  uint32_t param_count)
+{
+	ARG_UNUSED(param_count);
+
+	int err;
+	uint16_t type;
+	size_t size;
+
+	switch (cmd_type) {
+	case AT_PARSER_CMD_TYPE_SET:
+#if defined(CONFIG_SM_PC_MODEM_TRACE_UPLOAD)
+		if (sm_pc_trace_pending() || sm_pc_trace_observability_busy()) {
+			return -EBUSY;
+		}
+#endif
+		err = at_parser_num_get(parser, 1, &type);
+		if (err) {
+			LOG_ERR("Failed to get type: %d", err);
+			return err;
+		}
+
+		if (sm_bootloader_mode_enabled && type != DFU_TYPE_FULL_MFW) {
+			LOG_ERR("DFU type %d is not supported in bootloader mode", type);
+			return -EOPNOTSUPP;
+		}
+
+		switch (type) {
+		case DFU_TYPE_APP:
+#if defined(SM_DFU_BL_SUPPORTED)
+		case DFU_TYPE_MCUBOOT_BL:
+#endif
+			err = at_parser_num_get(parser, 2, &size);
+			if (err) {
+				LOG_ERR("Failed to get size: %d", err);
+				return err;
+			}
+
+			if (!app_dfu_buffer_initialized) {
+				err = dfu_target_mcuboot_set_buf(app_dfu_buffer,
+								 APP_DFU_BUFFER_SIZE);
+				if (err) {
+					LOG_ERR("Failed to set MCUboot DFU buffer: %d", err);
+					return err;
+				}
+				app_dfu_buffer_initialized = true;
+			}
+
+			err = dfu_target_mcuboot_init(size, 0, NULL);
+			if (err == -EFAULT) {
+				/* Already initialized - abort and retry */
+				LOG_WRN("MCUboot DFU already initialized, aborting and retrying");
+				(void)dfu_target_mcuboot_done(false);
+				err = dfu_target_mcuboot_init(size, 0, NULL);
+			}
+			if (err) {
+				LOG_ERR("Failed to initialize MCUboot DFU target: %d", err);
+				return err;
+			}
+
+			LOG_INF("%s DFU initialized",
+				type == DFU_TYPE_APP ? "MCUboot" : "MCUboot bootloader");
+#if defined(CONFIG_SM_PC_MODEM_TRACE_UPLOAD)
+			pc_trace_dfu_busy = true;
+#endif
+			return 0;
+		case DFU_TYPE_DELTA_MFW:
+			err = at_parser_num_get(parser, 2, &size);
+			if (err) {
+				LOG_ERR("Failed to get size: %d", err);
+				return err;
+			}
+
+			err = dfu_target_modem_delta_init(size, 0, delta_dfu_evt_handler);
+			if (err) {
+				LOG_ERR("Failed to initialize delta modem firmware: %d", err);
+				return err;
+			}
+
+			LOG_INF("Delta modem firmware initialized");
+#if defined(CONFIG_SM_PC_MODEM_TRACE_UPLOAD)
+			pc_trace_dfu_busy = true;
+#endif
+			return 0;
+		case DFU_TYPE_FULL_MFW:
+			if (!IS_ENABLED(CONFIG_SM_DFU_MODEM_FULL)) {
+				LOG_ERR("Full modem DFU is not enabled");
+				return -EOPNOTSUPP;
+			}
+
+			LOG_WRN("FW is programmed to modem flash in 8 kB blocks, after the first "
+				"block the modem remains unusable until the update completes");
+			err = bootloader_mode_request(true);
+			if (err) {
+				LOG_ERR("Failed to enable bootloader mode: %d", err);
+				return err;
+			}
+
+			rsp_send_ok();
+
+			(void)set_full_mfw_dfu_segment_type(DFU_FULL_MFW_SEGMENT_BOOTLOADER);
+
+			sm_uart_tx_flush();
+			sm_log_flush();
+			sys_reboot(SYS_REBOOT_COLD);
+		default:
+			LOG_ERR("Invalid target type: %d", type);
+			return -EINVAL;
+		}
+	case AT_PARSER_CMD_TYPE_TEST:
+#if defined(CONFIG_SM_DFU_MODEM_FULL)
+#if defined(SM_DFU_BL_SUPPORTED)
+		rsp_send("\r\n#XDFUINIT: (%d,%d,%d,%d),<size>\r\n",
+			DFU_TYPE_APP, DFU_TYPE_DELTA_MFW, DFU_TYPE_FULL_MFW,
+			DFU_TYPE_MCUBOOT_BL);
+#else
+		rsp_send("\r\n#XDFUINIT: (%d,%d,%d),<size>\r\n",
+			DFU_TYPE_APP, DFU_TYPE_DELTA_MFW, DFU_TYPE_FULL_MFW);
+#endif
+#else
+#if defined(SM_DFU_BL_SUPPORTED)
+		rsp_send("\r\n#XDFUINIT: (%d,%d,%d),<size>\r\n",
+			DFU_TYPE_APP, DFU_TYPE_DELTA_MFW, DFU_TYPE_MCUBOOT_BL);
+#else
+		rsp_send("\r\n#XDFUINIT: (%d,%d),<size>\r\n",
+			DFU_TYPE_APP, DFU_TYPE_DELTA_MFW);
+#endif
+#endif
+		return 0;
+	default:
+		LOG_ERR("Invalid command type: %d", cmd_type);
+		return -EINVAL;
+	}
+}
+
+SM_AT_CMD_CUSTOM(xdfu_write, "AT#XDFUWRITE", handle_at_xdfu_write);
+static int handle_at_xdfu_write(enum at_parser_cmd_type cmd_type, struct at_parser *parser,
+				  uint32_t param_count)
+{
+#if defined(CONFIG_SM_PC_MODEM_TRACE_UPLOAD)
+	if (cmd_type == AT_PARSER_CMD_TYPE_SET &&
+	    (sm_pc_trace_pending() || sm_pc_trace_observability_busy())) {
+		return -EBUSY;
+	}
+#endif
+	int err;
+	uint16_t type;
+
+	switch (cmd_type) {
+	case AT_PARSER_CMD_TYPE_SET:
+		err = at_parser_num_get(parser, 1, &type);
+		if (err) {
+			LOG_ERR("Failed to get type: %d", err);
+			return err;
+		}
+
+		if (sm_bootloader_mode_enabled && type != DFU_TYPE_FULL_MFW) {
+			LOG_ERR("DFU type %d is not supported in bootloader mode", type);
+			return -EOPNOTSUPP;
+		}
+
+		switch (type) {
+		case DFU_TYPE_APP:
+#if defined(SM_DFU_BL_SUPPORTED)
+		case DFU_TYPE_MCUBOOT_BL:
+#endif
+			if (param_count != 4) {
+				LOG_ERR("Invalid number of parameters for data write");
+				return -EINVAL;
+			}
+			err = at_parser_num_get(parser, 2, &xdfu_app_datamode_context.addr);
+			if (err) {
+				LOG_ERR("Failed to get address: %d", err);
+				return err;
+			}
+			err = at_parser_num_get(parser, 3, &xdfu_app_datamode_context.len);
+			if (err) {
+				LOG_ERR("Failed to get length: %d", err);
+				return err;
+			}
+
+			if (xdfu_app_datamode_context.len == 0) {
+				LOG_ERR("Length cannot be 0");
+				return -EINVAL;
+			}
+
+			/* Prepare per-chunk accounting for the datamode callback. */
+			xdfu_current_image_type = (enum xdfu_image_type)type;
+			xdfu_bytes_written = 0;
+			xdfu_status = 0;
+
+			err = enter_datamode(xdfu_datamode_callback,
+						xdfu_app_datamode_context.len);
+			if (err) {
+				LOG_ERR("Failed to enter data write mode: %d", err);
+				return err;
+			}
+
+			return 0;
+		case DFU_TYPE_DELTA_MFW:
+			if (param_count != 4) {
+				LOG_ERR("Invalid number of parameters for data write");
+				return -EINVAL;
+			}
+			err = at_parser_num_get(parser, 2, &xdfu_delta_mfw_datamode_context.addr);
+			if (err) {
+				LOG_ERR("Failed to get address: %d", err);
+				return err;
+			}
+			err = at_parser_num_get(parser, 3, &xdfu_delta_mfw_datamode_context.len);
+			if (err) {
+				LOG_ERR("Failed to get length: %d", err);
+				return err;
+			}
+
+			if (xdfu_delta_mfw_datamode_context.len == 0) {
+				LOG_ERR("Length cannot be 0");
+				return -EINVAL;
+			}
+
+			/* Prepare per-chunk accounting for the datamode callback. */
+			xdfu_current_image_type = DFU_TYPE_DELTA_MFW;
+			xdfu_bytes_written = 0;
+			xdfu_status = 0;
+
+			err = enter_datamode(xdfu_datamode_callback,
+						xdfu_delta_mfw_datamode_context.len);
+			if (err) {
+				LOG_ERR("Failed to enter data write mode: %d", err);
+				return err;
+			}
+
+			return 0;
+		case DFU_TYPE_FULL_MFW:
+			if (!IS_ENABLED(CONFIG_SM_DFU_MODEM_FULL)) {
+				LOG_ERR("Full modem DFU is not enabled");
+				return -EOPNOTSUPP;
+			}
+
+			/*
+			 * POINT OF NO RETURN: Firmware data is programmed to modem flash
+			 * in 8 kB blocks. After the first block, the modem remains unusable
+			 * until the update completes. Bootloader segment writes can
+			 * still be rolled back.
+			 */
+			if (param_count != 4) {
+				LOG_ERR("Invalid number of parameters for data write");
+				return -EINVAL;
+			}
+
+			err = at_parser_num_get(parser, 2, &xdfu_full_mfw_datamode_context.addr);
+			if (err) {
+				LOG_ERR("Failed to get address: %d", err);
+				return err;
+			}
+
+			err = at_parser_num_get(parser, 3, &xdfu_full_mfw_datamode_context.len);
+			if (err) {
+				LOG_ERR("Failed to get length: %d", err);
+				return err;
+			}
+
+			if (xdfu_full_mfw_datamode_context.len == 0) {
+				LOG_ERR("Length cannot be 0");
+				return -EINVAL;
+			}
+
+			/* Prepare per-chunk accounting for the datamode callback. */
+			xdfu_current_image_type = DFU_TYPE_FULL_MFW;
+			xdfu_bytes_written = 0;
+			xdfu_status = 0;
+
+			err = enter_datamode(xdfu_datamode_callback,
+						xdfu_full_mfw_datamode_context.len);
+			if (err) {
+				LOG_ERR("Failed to enter data write mode: %d", err);
+				return err;
+			}
+
+			return 0;
+		default:
+			LOG_ERR("Invalid target type: %d", type);
+			return -EINVAL;
+		}
+	case AT_PARSER_CMD_TYPE_TEST:
+#if defined(CONFIG_SM_DFU_MODEM_FULL)
+#if defined(SM_DFU_BL_SUPPORTED)
+		rsp_send("\r\n#XDFUWRITE: (%d,%d,%d,%d),<addr>,<len>\r\n",
+			DFU_TYPE_APP, DFU_TYPE_DELTA_MFW, DFU_TYPE_FULL_MFW,
+			DFU_TYPE_MCUBOOT_BL);
+#else
+		rsp_send("\r\n#XDFUWRITE: (%d,%d,%d),<addr>,<len>\r\n",
+			DFU_TYPE_APP, DFU_TYPE_DELTA_MFW, DFU_TYPE_FULL_MFW);
+#endif
+#else
+#if defined(SM_DFU_BL_SUPPORTED)
+		rsp_send("\r\n#XDFUWRITE: (%d,%d,%d),<addr>,<len>\r\n",
+			DFU_TYPE_APP, DFU_TYPE_DELTA_MFW, DFU_TYPE_MCUBOOT_BL);
+#else
+		rsp_send("\r\n#XDFUWRITE: (%d,%d),<addr>,<len>\r\n",
+			DFU_TYPE_APP, DFU_TYPE_DELTA_MFW);
+#endif
+#endif
+		return 0;
+	default:
+		LOG_ERR("Invalid command type: %d", cmd_type);
+		return -EINVAL;
+	}
+}
+
+SM_AT_CMD_CUSTOM(xdfu_apply, "AT#XDFUAPPLY", handle_at_xdfu_apply);
+static int handle_at_xdfu_apply(enum at_parser_cmd_type cmd_type, struct at_parser *parser,
+				  uint32_t param_count)
+{
+#if defined(CONFIG_SM_PC_MODEM_TRACE_UPLOAD)
+	if (cmd_type == AT_PARSER_CMD_TYPE_SET &&
+	    (sm_pc_trace_pending() || sm_pc_trace_observability_busy())) {
+		return -EBUSY;
+	}
+#endif
+	ARG_UNUSED(param_count);
+
+	int err;
+	uint16_t type;
+
+	switch (cmd_type) {
+	case AT_PARSER_CMD_TYPE_SET:
+		err = at_parser_num_get(parser, 1, &type);
+		if (err) {
+			LOG_ERR("Failed to get type: %d", err);
+			return err;
+		}
+
+		if (sm_bootloader_mode_enabled && type != DFU_TYPE_FULL_MFW) {
+			LOG_ERR("DFU type %d is not supported in bootloader mode", type);
+			return -EOPNOTSUPP;
+		}
+
+		switch (type) {
+		case DFU_TYPE_APP:
+#if defined(SM_DFU_BL_SUPPORTED)
+		case DFU_TYPE_MCUBOOT_BL:
+#endif
+			err = dfu_target_mcuboot_done(true);
+			if (err) {
+				LOG_ERR("%s update finalize failed: %d",
+					type == DFU_TYPE_APP ? "App firmware"
+							     : "MCUboot bootloader",
+					err);
+			} else {
+				err = dfu_target_mcuboot_schedule_update(0);
+				if (err) {
+					LOG_ERR("Failed to schedule %s update: %d",
+						type == DFU_TYPE_APP ? "App firmware"
+								     : "MCUboot bootloader",
+						err);
+				}
+			}
+
+			urc_send("#XDFU: %u,%u,%d\r\n",
+				type, DFU_OPERATION_APPLY_UPDATE, err ? -1 : 0);
+
+			if (!err) {
+				LOG_INF("%s update scheduled",
+				type == DFU_TYPE_APP ? "App firmware" : "MCUboot bootloader");
+			}
+
+			return 0;
+		case DFU_TYPE_DELTA_MFW:
+			err = dfu_target_modem_delta_done(true);
+			if (err) {
+				LOG_ERR("Delta modem firmware update failed: %d", err);
+			} else {
+				err = dfu_target_modem_delta_schedule_update(0);
+				if (err) {
+					LOG_ERR("Failed to schedule delta MFW update: %d", err);
+				}
+			}
+
+			urc_send("#XDFU: %u,%u,%d\r\n",
+				DFU_TYPE_DELTA_MFW, DFU_OPERATION_APPLY_UPDATE, err ? -1 : 0);
+
+			if (!err) {
+				LOG_INF("Delta modem firmware update scheduled");
+			}
+
+			return 0;
+		case DFU_TYPE_FULL_MFW:
+			if (!IS_ENABLED(CONFIG_SM_DFU_MODEM_FULL)) {
+				LOG_ERR("Full modem DFU is not enabled");
+				return -EOPNOTSUPP;
+			}
+
+			err = nrf_modem_bootloader_update();
+			if (err) {
+				LOG_ERR("Failed to update bootloader: %d", err);
+			} else {
+				if (full_mfw_dfu_segment_type ==
+					DFU_FULL_MFW_SEGMENT_BOOTLOADER) {
+					LOG_INF("Bootloader segment updated");
+					LOG_WRN("FW is programmed to modem flash in 8 kB "
+						"blocks, after the first block the modem remains "
+						"unusable until the update completes");
+					(void)set_full_mfw_dfu_segment_type(
+						DFU_FULL_MFW_SEGMENT_FIRMWARE);
+				} else if (full_mfw_dfu_segment_type ==
+					   DFU_FULL_MFW_SEGMENT_FIRMWARE) {
+					(void)set_full_mfw_dfu_segment_type(
+						DFU_FULL_MFW_SEGMENT_BOOTLOADER);
+					/* We are still executing a AT command, so send OK
+					 * and #XDFU URC message using rsp_send() before the
+					 * device is rebooted.
+					 */
+					rsp_send_ok();
+					rsp_send("#XDFU: %u,%u,%d\r\n", DFU_TYPE_FULL_MFW,
+						 DFU_OPERATION_APPLY_UPDATE, 0);
+					sm_uart_tx_flush();
+					LOG_INF("Firmware update complete, rebooting");
+					sm_log_flush();
+					sys_reboot(SYS_REBOOT_COLD);
+				}
+			}
+
+			urc_send("#XDFU: %u,%u,%d\r\n",
+				DFU_TYPE_FULL_MFW, DFU_OPERATION_APPLY_UPDATE, err ? -1 : 0);
+
+			return 0;
+		default:
+			LOG_ERR("Invalid target type: %d", type);
+			return -EINVAL;
+		}
+	case AT_PARSER_CMD_TYPE_TEST:
+#if defined(CONFIG_SM_DFU_MODEM_FULL)
+#if defined(SM_DFU_BL_SUPPORTED)
+		rsp_send("\r\n#XDFUAPPLY: (%d,%d,%d,%d)\r\n",
+			DFU_TYPE_APP, DFU_TYPE_DELTA_MFW, DFU_TYPE_FULL_MFW,
+			DFU_TYPE_MCUBOOT_BL);
+#else
+		rsp_send("\r\n#XDFUAPPLY: (%d,%d,%d)\r\n",
+			DFU_TYPE_APP, DFU_TYPE_DELTA_MFW, DFU_TYPE_FULL_MFW);
+#endif
+#else
+#if defined(SM_DFU_BL_SUPPORTED)
+		rsp_send("\r\n#XDFUAPPLY: (%d,%d,%d)\r\n",
+			DFU_TYPE_APP, DFU_TYPE_DELTA_MFW, DFU_TYPE_MCUBOOT_BL);
+#else
+		rsp_send("\r\n#XDFUAPPLY: (%d,%d)\r\n",
+			DFU_TYPE_APP, DFU_TYPE_DELTA_MFW);
+#endif
+#endif
+		return 0;
+	default:
+		LOG_ERR("Invalid command type: %d", cmd_type);
+		return -EINVAL;
+	}
+}
+
+int sm_at_handle_xdfu_init(char *buf, size_t len, char *at_cmd)
+{
+	return sm_at_cb_wrapper(buf, len, at_cmd, sizeof("AT#XDFUINIT") - 1, handle_at_xdfu_init);
+}
+
+int sm_at_handle_xdfu_write(char *buf, size_t len, char *at_cmd)
+{
+	return sm_at_cb_wrapper(buf, len, at_cmd, sizeof("AT#XDFUWRITE") - 1, handle_at_xdfu_write);
+}
+
+int sm_at_handle_xdfu_apply(char *buf, size_t len, char *at_cmd)
+{
+	return sm_at_cb_wrapper(buf, len, at_cmd, sizeof("AT#XDFUAPPLY") - 1, handle_at_xdfu_apply);
+}

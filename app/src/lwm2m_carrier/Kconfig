@@ -1,0 +1,45 @@
+#
+# Copyright (c) 2023 Nordic Semiconductor ASA
+#
+# SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+
+config SM_CARRIER
+	bool "LwM2M Carrier support"
+	depends on LWM2M_CARRIER
+	select EXPERIMENTAL
+
+if SM_CARRIER
+
+config SM_CARRIER_APP_DATA_BUFFER_LEN
+	int "Size of the buffer for setting application data in hexadecimal string format"
+	default 1537
+	range 128 1537
+	help
+	  Specifies maximum application data size (in hexadecimal string format) to be set in the
+	  App Data Container, the Binary App Data Container or the Event Log objects.
+
+config SM_CARRIER_AUTO_STARTUP
+	bool "Enable automatic startup on boot"
+	depends on LWM2M_CARRIER_SETTINGS
+	help
+	  Enable automatic startup of the library on device boot. If this configuration is
+	  disabled, automatic startup is controlled through a dedicated AT command.
+
+config SM_CARRIER_AUTO_CONTROL
+	bool "Automatic handling of LwM2M requests"
+	depends on SM_AUTO_CONNECT
+	default y
+	help
+	  Enable automatic power off, reboot, link up or link down when requested by the LwM2M
+	  stack. If this is disabled, the host MCU must perform these operations via AT commands
+	  when requested.
+
+config HEAP_MEM_POOL_ADD_SIZE_SM_CARRIER
+	int "Additional heap memory pool size for LwM2M Carrier"
+	default 4096
+	help
+	  Additional heap memory pool size for LwM2M Carrier. This is added to the default heap
+	  memory pool size and can be used to ensure that there is enough memory for LwM2M Carrier
+	  operations.
+
+endif # SM_CARRIER

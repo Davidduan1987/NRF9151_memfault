@@ -1,0 +1,316 @@
+/*
+ * Copyright (c) 2019 Nordic Semiconductor ASA
+ *
+ * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+ */
+
+#ifndef SM_UTIL_
+#define SM_UTIL_
+
+/**@file sm_util.h
+ *
+ * @brief Utility functions for Serial Modem
+ * @{
+ */
+#include "sm_trap_macros.h"
+#include <modem/at_parser.h>
+#include <modem/lte_lc.h>
+#include <zephyr/logging/log.h>
+#include <zephyr/net/socket.h>
+#include <stdbool.h>
+#include <hal/nrf_gpio.h>
+#include <zephyr/modem/pipe.h>
+
+extern struct k_work_q sm_work_q; /* Serial Modem's main work queue. */
+#if defined(CONFIG_SM_BLOCKING_WORK_Q)
+extern struct k_work_q sm_blocking_work_q; /* Work queue for long-blocking operations. */
+#define sm_k_work_submit_blocking(work) k_work_submit_to_queue(&sm_blocking_work_q, (work))
+#else
+#define sm_k_work_submit_blocking(work) k_work_submit_to_queue(&sm_work_q, (work))
+#endif
+
+/** @return Whether the modem is in the given functional mode. */
+bool sm_is_modem_functional_mode(enum lte_lc_func_mode mode);
+
+/** @brief Puts the modem in minimal function mode. */
+int sm_power_off_modem(void);
+
+/** @brief Performs a reset of the SiP. */
+FUNC_NORETURN void sm_reset(void);
+
+/** Replacement for @c nrf_modem_at_printf() that cannot be
+ *  used so that the AT command interception works properly.
+ */
+int sm_util_at_printf(const char *fmt, ...);
+
+/** Replacement for @c nrf_modem_at_scanf() that cannot be
+ *  used so that the AT command interception works properly.
+ */
+int sm_util_at_scanf(const char *cmd, const char *fmt, ...);
+
+/** Forwards an AT command to the modem while bypassing interception.
+ *  @warning This must only be called from code that needs to bypass
+ *  AT command interception, such as from interception callbacks themselves.
+ *  @note This is only capable of handling AT responses that are
+ *  at most two lines long (including the line that holds the result code).
+ *  @return Like @c nrf_modem_at_cmd().
+ */
+int sm_util_at_cmd_no_intercept(char *buf, size_t len, const char *at_cmd);
+
+/**
+ * @brief Compare string ignoring case
+ *
+ * @param str1 First string
+ * @param str2 Second string
+ *
+ * @return true If two commands match, false if not.
+ */
+bool sm_util_casecmp(const char *str1, const char *str2);
+
+/**
+ * @brief Get string value from AT command with length check.
+ *
+ * @p len must be bigger than the string length, or an error is returned.
+ * The copied string is null-terminated.
+ *
+ * @param[in]     parser  AT parser.
+ * @param[in]     index   Parameter index in the AT parser.
+ * @param[out]    value   Pointer to the buffer where to copy the value.
+ * @param[in,out] len     Available space in @p value, returns actual length
+ *                        copied into string buffer in bytes, excluding the
+ *                        terminating null character.
+ *
+ * @retval 0 If the operation was successful.
+ *           Otherwise, a (negative) error code is returned.
+ */
+int util_string_get(struct at_parser *parser, size_t index, char *value, size_t *len);
+
+/**
+ * @brief Get float value from string value input in AT command.
+ *
+ * @note The string cannot be larger than 32.
+ *
+ * @param[in]     parser  AT parser.
+ * @param[in]     index   Parameter index in the AT parser.
+ * @param[out]    value   Pointer to the float where to store the value.
+ *
+ * @retval 0 If the operation was successful.
+ *           Otherwise, a (negative) error code is returned.
+ */
+int util_string_to_float_get(struct at_parser *parser, size_t index, float *value);
+
+/**
+ * @brief Get double value from string value input in AT command.
+ *
+ * @note The string cannot be larger than 32.
+ *
+ * @param[in]     parser  AT parser.
+ * @param[in]     index   Parameter index in the AT parser.
+ * @param[out]    value   Pointer to the double where to store the value.
+ *
+ * @retval 0 If the operation was successful.
+ *           Otherwise, a (negative) error code is returned.
+ */
+int util_string_to_double_get(struct at_parser *parser, size_t index, double *value);
+
+/**
+ * @brief use AT command to get IPv4 and IPv6 addresses for specified PDN
+ *
+ * @param[in] cid PDP Context ID as defined in "+CGDCONT" command (0~10).
+ * @param[out] addr4 Buffer to hold the IPv4 address. May be NULL.
+ * @param[out] addr6 Buffer to hold the IPv6 address. May be NULL.
+ */
+void util_get_ip_addr(int cid, char addr4[NET_INET_ADDRSTRLEN], char addr6[NET_INET6_ADDRSTRLEN]);
+
+/**
+ * @brief convert string to integer
+ *
+ * @param[in] str A string containing the representation of an integral number.
+ * @param[in] base The base, which must be between 2 and 36 inclusive or the special value 0.
+ * @param[out] output The converted integral number as a long int value.
+ *
+ * @retval 0 If the operation was successful.
+ *           Otherwise, a (negative) error code is returned.
+ */
+int util_str_to_int(const char *str, int base, int *output);
+
+/**
+ * @brief Resolve remote host by host name or IP address
+ *
+ * This function wraps up zsock_getaddrinfo() to return first resolved address.
+ *
+ * @param[in] cid PDP Context ID as defined in "+CGDCONT" command (0~10).
+ * @param[in] host Name or IP address of remote host.
+ * @param[in] port Service port of remote host.
+ * @param[in] family Desired address family for the returned address.
+ * @param[out] sa The returned address.
+ *
+ * @retval 0 If the operation was successful.
+ *           Otherwise, an errno code or a dns_resolve_status enum value
+ *           (defined in `zephyr/net/dns_resolve.h`).
+ */
+int util_resolve_host(int cid, const char *host, uint16_t port, int family,
+		      struct net_sockaddr *sa);
+
+/**
+ * @brief Get peer IP address and port in printable format.
+ *
+ * @param[in] peer Peer address structure.
+ * @param[out] addr IP address of the peer.
+ * @param[out] port Port of the peer.
+ * @retval 0 If the operation was successful.
+ *           Otherwise, a (negative) error code is returned.
+ */
+int util_get_peer_addr(struct net_sockaddr *peer, char addr[NET_INET6_ADDRSTRLEN], uint16_t *port);
+
+/**
+ * @brief Get PDN ID from AT command response
+ *
+ * @param[in] cid PDP Context ID as defined in "+CGDCONT" command (0~10).
+ *
+ * @retval PDN ID If the operation was successful.
+ *           Otherwise, a (negative) error code is returned.
+ */
+int sm_util_pdn_id_get(uint8_t cid);
+
+/**
+ * @brief PDN connection dynamic information structure.
+ *
+ * This structure holds dynamic information about the PDN connection.
+ */
+struct sm_pdn_dynamic_info {
+	/**
+	 * @brief IPv4 Maximum Transmission Unit.
+	 */
+	uint32_t ipv4_mtu;
+	/**
+	 * @brief IPv6 Maximum Transmission Unit.
+	 */
+	uint32_t ipv6_mtu;
+	/**
+	 * @brief Primary IPv4 DNS address.
+	 */
+	struct net_in_addr dns_addr4_primary;
+	/**
+	 * @brief Secondary IPv4 DNS address.
+	 */
+	struct net_in_addr dns_addr4_secondary;
+	/**
+	 * @brief Primary IPv6 DNS address.
+	 */
+	struct net_in6_addr dns_addr6_primary;
+	/**
+	 * @brief Secondary IPv6 DNS address.
+	 */
+	struct net_in6_addr dns_addr6_secondary;
+};
+
+/**
+ * @brief Retrieve dynamic parameters of a given PDN connection.
+ *
+ * @param[in] cid The PDP context ID.
+ * @param[out] pdn_info PDN dynamic info.
+ *
+ * @return Zero on success or an error code on failure.
+ */
+int sm_util_pdn_dynamic_info_get(uint8_t cid, struct sm_pdn_dynamic_info *pdn_info);
+
+
+/**
+ * @brief Read the currently active bootloader slot.
+ *
+ * @return 0 if the active slot is S0, 1 if the active slot is S1, negative errno on failure.
+ */
+int sm_util_mcuboot_active_slot(void);
+
+/**
+ * @brief Read the fw_info version of the currently active MCUboot bootloader slot.
+ *
+ * @param[out] version  fw_info version of the active slot.
+ * @return 0 on success, negative errno on failure.
+ */
+int sm_util_mcuboot_active_version(uint32_t *version);
+
+/**
+ * @defgroup sm_modem_pipe_events Modem Pipe Event Bits
+ *
+ * These are not same as the enum modem_pipe_event.
+ * See modem_pipe.c from Zephyr.
+ *
+ * @{
+ */
+#define Z_PIPE_OPENED_BIT        BIT(0)
+#define Z_PIPE_CLOSED_BIT        BIT(1)
+#define Z_PIPE_RECEIVE_READY_BIT BIT(2)
+#define Z_PIPE_TRANSMIT_IDLE_BIT BIT(3)
+/* @}*/
+
+/**
+ * @brief Check whether a modem pipe is open
+ *
+ * @param pipe Modem pipe to check.
+ * @return true if pipe is open
+ * @return false if pipe is not open
+ */
+static inline bool sm_pipe_is_open(struct modem_pipe *pipe)
+{
+	return k_event_test(&pipe->event, Z_PIPE_OPENED_BIT) ==
+	       Z_PIPE_OPENED_BIT;
+}
+
+/**
+ * @brief Wait for specific event using modem pipe's internal event structure.
+ *
+ * This allows waiting for specific event on the pipe without registering the callback.
+ * See Z_MODEM_PIPE_EVENT_* definitions for events.
+ */
+static inline void sm_wait_for_pipe_event(struct modem_pipe *pipe, uint32_t events)
+{
+	k_event_wait(&pipe->event, events, false, K_SECONDS(1));
+}
+
+/**
+ * @brief Get the current functional mode of the modem
+ *
+ * @return value from AT+CFUN? or a negative error code on failure
+ */
+int sm_util_cfun_get(void);
+
+/**
+ * @brief Check if modem is in functional mode that allows LTE connectivity
+ *
+ * @return true if modem is in functional mode 1 (normal) or 21 (LTE is activated).
+ * @return false otherwise
+ */
+bool sm_util_cfun_is_lte_enabled(void);
+
+/**
+ * @brief Get the current network registration status of the modem
+ *
+ * @return value from AT+CEREG? or a negative error code on failure
+ */
+int sm_util_cereg_get(void);
+
+/**
+ * @brief Check if modem is registered to a cellular network
+ *
+ * @return true if registered or roaming
+ * @return false if not registered
+ */
+bool sm_util_cereg_is_registered(void);
+
+/**
+ * @brief Check if a PDP context is active
+ *
+ * Use AT+CGPADDR=<cid> to check if the given PDP context have valid address(es),
+ * which is an indication of whether the PDP context is active or not.
+ *
+ * @param[in] cid The PDP context ID.
+ * @return true if the PDP context is active
+ * @return false if the PDP context is not active
+ */
+bool sm_util_is_cid_active(uint8_t cid);
+
+/** @} */
+
+#endif /* SM_UTIL_ */

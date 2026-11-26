@@ -1,0 +1,33 @@
+*.o
+*.d
+*.cmd
+*.log
+*.pyc
+*.swp
+*.swo
+*~
+build
+build-*
+build_*
+_build_*
+# Not build output despite the name.
+!doc/_scripts/build_docsets.py
+cscope.*
+.dir
+venv
+.venv
+.idea
+.xxproject
+.envrc
+.vscode
+sanity-out*
+twister-out*
+
+# Local credentials and signing material
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.pfx
+secrets.conf

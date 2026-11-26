@@ -1,0 +1,1094 @@
+nRF Cloud AT commands
+*********************
+
+.. contents::
+   :local:
+   :depth: 1
+
+The page describes the following nRF Cloud-related AT commands:
+
+  * nRF Cloud connection (see :ref:`SM_AT_NRFCLOUD`)
+  * nRF Cloud location (see :ref:`SM_AT_NRFCLOUDPOS`)
+  * nRF Cloud FOTA (see :ref:`SM_AT_NRFCLOUDFOTA`)
+  * nRF Cloud observability (see :ref:`SM_AT_NRFCLOUDOBS` and commands starting with ``#XNRFCLOUDOBS``)
+
+.. note::
+   Before using nRF Cloud AT commands, you must onboard and claim the device in nRF Cloud.
+   See :ref:`SM_AT_PROVISIONING` for information about device provisioning and claiming.
+
+.. _SM_AT_NRFCLOUDOBS:
+
+.. rubric:: Observability #XNRFCLOUDOBS*
+
+The ``#XNRFCLOUDOBS*`` commands control the Memfault data that the device collects (metrics, events, logs, and, in builds that include it, a coredump) and its upload to nRF Cloud over the CoAP transport.
+
+To use the ``#XNRFCLOUDOBS*`` commands that access the network (``#XNRFCLOUDOBSUPLOAD`` and ``#XNRFCLOUDOBSFORWARD``), the device must be connected to nRF Cloud. See :ref:`SM_AT_NRFCLOUD`.
+
+.. only:: not nrf91m1
+
+   ``#XNRFCLOUDOBSDEVINFO``, ``#XNRFCLOUDOBSCRASH``, and ``#XNRFCLOUDOBSEXPORT`` additionally require the :ref:`CONFIG_SM_NRF_CLOUD_OBSERVABILITY_DEBUG <CONFIG_SM_NRF_CLOUD_OBSERVABILITY_DEBUG>` Kconfig option, which is disabled by default.
+
+Upload is host-driven.
+Automatic uploads are disabled by default.
+The host enables them with ``AT#XNRFCLOUDOBSAUTO=1`` or initiates uploads on demand with ``AT#XNRFCLOUDOBSUPLOAD``.
+
+The ``<project_key>`` parameter, used by several commands, is a string.
+It is a 32-character Memfault project key.
+When it is present and not empty, it overrides the server-side project-key routing, sending the data to the specified Memfault project.
+For more information about Memfault project keys, see `Memfault Project Keys`_.
+Find your project key in `Memfault Project Settings`_.
+
+.. _SM_AT_NRFCLOUD:
+
+nRF Cloud access #XNRFCLOUD
+===========================
+
+The ``#XNRFCLOUD`` command controls the access to the nRF Cloud service.
+
+.. note::
+   To use ``#XNRFCLOUD``, the following preconditions apply:
+
+   * You must first onboard the device to nRF Cloud, using the device-specific UUID as the device ID.
+     See `nRF Cloud Preconnect onboarding`_ for more information.
+
+   .. only:: not nrf91m1
+
+      * The :ref:`CONFIG_SM_NRF_CLOUD <CONFIG_SM_NRF_CLOUD>` Kconfig option must be enabled.
+
+   * The device must have access to nRF Cloud through the LTE network.
+
+Set command
+-----------
+
+The set command allows you to access the nRF Cloud service.
+
+.. note::
+
+   The ``#XNRFCLOUD`` command uses default PDN connection with ID ``0``.
+   Raw sockets must not use the PDN connection at the same time.
+   See :ref:`SM_AT_SOCKET_RAW_SOCKET_LIMITATION` for more information.
+
+Syntax
+~~~~~~
+
+::
+
+   AT#XNRFCLOUD=<op>[,<send_location>]
+
+The parameters and their defined values are the following:
+
+<op>
+   * ``0`` - Disconnect from the nRF Cloud service.
+   * ``1`` - Connect to the nRF Cloud service.
+   * ``2`` - Send a message in the JSON format to the nRF Cloud service.
+
+   When ``<op>`` is ``2``, |SM| enters :ref:`sm_data_mode`.
+
+<send_location>
+   Used only when the value of ``<op>`` is ``1``.
+
+   * ``0`` - The device location is not sent to nRF Cloud.
+     This is the default behavior if the parameter is omitted.
+   * ``1`` - The device location is sent to nRF Cloud.
+
+   .. note::
+      The location is sent to the nRF Cloud whenever a fix is produced by the GNSS module.
+      You must use the :ref:`#XGNSS <SM_AT_GNSS>` AT command to start GNSS either in single-fix or periodic navigation mode.
+      The interval between fixes must be at least 5 seconds.
+
+Unsolicited notification
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+::
+
+   #XNRFCLOUD: <ready>,<send_location>
+
+The parameters and their defined values are the following:
+
+<ready>
+   Integer.
+   Indicates whether the connection to nRF Cloud is established or not.
+
+<send_location>
+   Integer.
+   Indicates whether the device location will be sent to nRF Cloud or not.
+
+Example
+~~~~~~~
+
+::
+
+  // Connect to nRF Cloud without sending location.
+  AT#XNRFCLOUD=1
+
+  OK
+
+  #XNRFCLOUD: 1,0
+  // Send a message to nRF Cloud.
+  AT#XNRFCLOUD=2
+
+  OK
+  {"msg":"Hello, nRF Cloud"}+++
+
+  #XDATAMODE: 0
+  // Disconnect from nRF Cloud.
+  AT#XNRFCLOUD=0
+
+  OK
+
+  #XNRFCLOUD: 0,0
+  // Connect to nRF Cloud and send location.
+  AT#XNRFCLOUD=1,1
+
+  OK
+
+  #XNRFCLOUD: 1,1
+  AT#XNRFCLOUD=0
+
+  #XNRFCLOUD: 0,1
+
+  OK
+
+Read command
+------------
+
+The read command checks whether the connection to nRF Cloud is established or not.
+
+Syntax
+~~~~~~
+
+::
+
+   AT#XNRFCLOUD?
+
+Response syntax
+~~~~~~~~~~~~~~~
+
+::
+
+   #XNRFCLOUD: <ready>,<send_location>,<sec_tag>,<device_id>
+
+The parameters and their defined values are the following:
+
+<ready>
+   Integer.
+   Indicates whether the connection to nRF Cloud is established or not.
+
+<send_location>
+   Integer.
+   Indicates whether the device location will be sent to nRF Cloud or not.
+
+<sec_tag>
+   Integer.
+   The ``sec_tag`` used for accessing nRF Cloud.
+
+<device_id>
+   String.
+   The device ID used for accessing nRF Cloud.
+
+Example
+~~~~~~~
+
+::
+
+  AT#XNRFCLOUD?
+
+  #XNRFCLOUD: 1,0,16842753,"50503041-3633-4261-803d-1e2b8f70111a"
+
+  OK
+
+Test command
+------------
+
+The test command tests the existence of the command and provides information about the type of its subparameters.
+
+Syntax
+~~~~~~
+
+::
+
+   AT#XNRFCLOUD=?
+
+Example
+~~~~~~~
+
+::
+
+  AT#XNRFCLOUD=?
+
+  #XNRFCLOUD: (0,1,2),<send_location>
+
+  OK
+
+.. _SM_AT_NRFCLOUDPOS:
+
+nRF Cloud location #XNRFCLOUDPOS
+================================
+
+The ``#XNRFCLOUDPOS`` command sends a request to nRF Cloud to determine the device's location.
+The request uses information from the cellular network, Wi-Fi® access points, or both.
+
+.. note::
+   To use ``#XNRFCLOUDPOS``, the device must be connected to nRF Cloud using :ref:`#XNRFCLOUD <SM_AT_NRFCLOUD>`.
+
+   .. only:: not nrf91m1
+
+      Also, the :ref:`CONFIG_SM_NRF_CLOUD_LOCATION <CONFIG_SM_NRF_CLOUD_LOCATION>` Kconfig option must be enabled.
+
+Set command
+-----------
+
+The set command allows sending a location request to nRF Cloud.
+
+Syntax
+~~~~~~
+
+::
+
+   AT#XNRFCLOUDPOS=<cell_count>,<wifi_pos>[,<MAC 1>[,<RSSI 1>],<MAC 2>[,<RSSI 2>][,<MAC 3>[...]]]
+
+The parameters and their defined values are the following:
+
+<cell_count>
+   Integer.
+   The number of cells to include in the location request.
+   The value range is ``0`` to ``15``.
+   For cellular positioning, a recommended value is ``4``.
+   ``0`` means that no cellular network information will be included in the location request.
+   The |SM| uses the ``AT%NCELLMEAS`` command to retrieve the cellular network information, and depending on the value of ``<cell_count>``, the command might be executed multiple times.
+
+   .. note::
+
+      Since the |SM| uses the ``AT%NCELLMEAS`` command internally, the host must not use the ``AT%NCELLMEAS`` command during ``#XNRFCLOUDPOS`` command execution.
+      You may still use ``AT%NCELLMEAS`` command before or after ``#XNRFCLOUDPOS`` command execution for your own purposes.
+      You will also see ``%NCELLMEAS`` notifications, which you can ignore, during the ``#XNRFCLOUDPOS`` command execution.
+
+<wifi_pos>
+   * ``0`` - Do not include Wi-Fi access point information in the location request.
+   * ``1`` - Use Wi-Fi access point information.
+     The access points must be given as additional parameters to the command.
+     The minimum number of access points to provide is two (``NRF_CLOUD_LOCATION_WIFI_AP_CNT_MIN``), and the maximum is limited by the maximum size of the AT command, which is 8190 bytes, including the terminator character.
+
+<MAC x>
+   String.
+   The MAC address of a Wi-Fi access point.
+   Must be formatted as ``%02x:%02x:%02x:%02x:%02x:%02x`` (``WIFI_MAC_ADDR_TEMPLATE``).
+
+<RSSI x>
+   Integer.
+   Optional.
+   The signal strength of a Wi-Fi access point in dBm, between ``-128`` and ``0``.
+   If provided, it must follow the MAC address parameter of the access point.
+   Providing the RSSI parameters helps improve the accuracy of the Wi-Fi location.
+
+Unsolicited notification
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+::
+
+   #XNRFCLOUDPOS: <status>[,<type>,<latitude>,<longitude>,<uncertainty>]
+
+The parameters and their defined values are the following:
+
+<status>
+   * ``0`` - Successful request.
+     Other parameters are also present.
+   * ``-1`` - Location request failed.
+   * ``<positive integer>`` - Requesting location from the cloud failed with cloud error as defined in :c:enum:`nrf_cloud_error` values.
+
+This is emitted when a successful response to a sent location request is received.
+
+<type>
+   The service used to fulfill the location request.
+
+   * ``0`` (:c:enumerator:`LOCATION_TYPE_SINGLE_CELL`) - Single-cell cellular location.
+   * ``1`` (:c:enumerator:`LOCATION_TYPE_MULTI_CELL`) - Multi-cell cellular location.
+   * ``2`` (:c:enumerator:`LOCATION_TYPE_WIFI`) - Wi-Fi location.
+
+<latitude>
+   Float.
+   The latitude in degrees.
+
+<longitude>
+   Float.
+   The longitude in degrees.
+
+<uncertainty>
+   Float.
+   The radius of the uncertainty circle around the location in meters, also known as Horizontal Positioning Error (HPE).
+
+Example
+~~~~~~~
+
+::
+
+  AT%XSYSTEMMODE=1,0,0,0
+
+  OK
+  AT+CFUN=1
+
+  OK
+  AT#XNRFCLOUD=1
+
+  OK
+
+  #XNRFCLOUD: 1,0
+  AT#XNRFCLOUDPOS=1,0
+
+  OK
+
+  #XNRFCLOUDPOS: 0,0,35.455833,139.626111,1094
+
+  AT#XNRFCLOUDPOS=5,0
+
+  OK
+
+  %NCELLMEAS: 0,"0199F10A","44020","107E",65535,3750,5,49,27,107504,3750,251,33,4,0,475,107,26,14,25,475,58,26,17,25,475,277,24,9,25,475,51,18,1,25
+
+  %NCELLMEAS: 0,"01234567","44020","0340",50,175456,3400,34,5,24,1775066,1,0,"00143FAE","44020","0140",65535,0,6200,47,40,14,1775066,0,0
+
+  %NCELLMEAS: 0,"00987654","44020","0240",50,1754746,5500,44,4,4,1463457,1,0,"002F4344","44020","0140",65535,0,6200,47,40,14,1775066,0,0,"001C0502","44013","5A00",65535,0,6400,130,29,18,1775124,0,0,"00136107","44013","5A00",65535,0,3600,202,26,13,234533,0,0
+
+  #XNRFCLOUDPOS: 0,1,35.455833,139.626111,1094
+  AT#XNRFCLOUDPOS=0,1,"40:9b:cd:c1:5a:40","00:90:fe:eb:4f:42"
+
+  OK
+
+  #XNRFCLOUDPOS: 0,2,35.457335,139.624443,60
+  AT#XNRFCLOUDPOS=0,1,"40:9b:cd:c1:5a:40",-40,"00:90:fe:eb:4f:42",-69
+
+  OK
+
+  #XNRFCLOUDPOS: 0,2,35.457346,139.624449,20
+
+Read command
+------------
+
+The read command is not supported.
+
+Test command
+------------
+
+The test command is not supported.
+
+.. _SM_AT_NRFCLOUDFOTA:
+
+nRF Cloud FOTA #XNRFCLOUDFOTA
+=============================
+
+The ``#XNRFCLOUDFOTA`` command checks for and downloads an application or modem firmware update using `Memfault release management`_, delivered over the same nRF Cloud CoAP transport as ``#XNRFCLOUDOBS*``.
+
+.. only:: not nrf91m1
+
+   Requires the :ref:`CONFIG_SM_NRF_CLOUD_FOTA <CONFIG_SM_NRF_CLOUD_FOTA>` Kconfig option.
+
+An application update is staged the same way as ``AT#XFOTA=1``, that is, the host activates it with the ``AT#XRESET`` AT command.
+A modem update is staged the same way as ``AT#XFOTA=2``, that is, the host activates it with the ``AT#XMODEMRESET`` AT command.
+Both share their FOTA session with ``#XFOTA``, but progress and completion are reported over the ``#XNRFCLOUDFOTA`` notification instead, using the same ``<fota_stage>``, ``<fota_status>`` and ``<fota_info>`` tuple as ``#XFOTA`` (see :ref:`SM_AT_FOTA` for download and activation semantics).
+Only one FOTA session can be ongoing at a time, regardless of which command initiated it.
+
+.. note::
+   Unlike ``AT#XFOTA``, ``#XNRFCLOUDFOTA`` does not support MCUboot bootloader updates.
+   This is expected to be a rare use case.
+   The support is planned for a future release.
+
+.. note::
+   ``<op>=2`` uses a dedicated Memfault project key for modem firmware, obtained from the General section of the modem firmware project's Project Settings, which is separate from the application project.
+
+   .. only:: not nrf91m1
+
+      Set it with the ``CONFIG_MEMFAULT_FOTA_MODEM_PROJECT_KEY`` Kconfig option, or override it at runtime with the ``<project_key>`` parameter.
+
+   .. only:: nrf91m1
+
+      Use the ``<project_key>`` parameter to set it at runtime.
+
+   When neither is set, the request targets the default project where the device was claimed.
+
+Set command
+-----------
+
+The set command starts a FOTA check, and the download if requested and an update is available.
+
+.. note::
+
+   The ``#XNRFCLOUDFOTA`` command uses default PDN connection with ID ``0``.
+   Raw sockets must not use the PDN connection at the same time.
+   See :ref:`SM_AT_SOCKET_RAW_SOCKET_LIMITATION` for more information.
+
+Syntax
+~~~~~~
+
+::
+
+   AT#XNRFCLOUDFOTA=<op>[,<project_key>]
+
+The parameters and their defined values are the following:
+
+<op>
+   * ``0`` - Cancel an ongoing download.
+     This is effective only after a download has started, that is, after the first ``#XNRFCLOUDFOTA`` progress notification.
+   * ``1`` - Check for and download an application update.
+   * ``2`` - Check for and download a modem firmware update.
+   * ``4`` - Check for an application update, without downloading it.
+   * ``6`` - Check for a modem firmware update, without downloading it.
+
+<project_key>
+   String.
+   Project key used for the FOTA operation.
+
+   .. only:: not nrf91m1
+
+      For ``<op>=1`` and ``<op>=4``, it overrides the application project key (``CONFIG_MEMFAULT_PROJECT_KEY``), and for ``<op>=2`` and ``<op>=6`` it overrides ``CONFIG_MEMFAULT_FOTA_MODEM_PROJECT_KEY``.
+      If this option is not provided and the corresponding Kconfig setting is unset, the request targets the default project where the device was claimed.
+
+   .. only:: nrf91m1
+
+      For ``<op>=1`` and ``<op>=4``, it is the application Memfault project key, and for ``<op>=2`` and ``<op>=6`` it is the modem Memfault project key.
+      If this option is not provided, the request targets the default project where the device was claimed.
+
+The command returns ``OK`` immediately and the check runs asynchronously.
+When it completes, an unsolicited notification is sent.
+
+Unsolicited notification
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+::
+
+   #XNRFCLOUDFOTA: <fota_stage>,<fota_status>[,<fota_info>]
+
+The ``<fota_stage>``, ``<fota_status>``, and ``<fota_info>`` parameters use the same values as the ``#XFOTA`` notification:
+
+.. include:: at_fota.rst
+   :start-after: sm_fota_urc_params_start
+   :end-before: sm_fota_urc_params_end
+
+When the FOTA check finishes without starting a download, ``<fota_stage>`` is ``0`` (*Init*) and ``<fota_info>`` indicates the result.
+This form is used by ``#XNRFCLOUDFOTA`` only (not ``#XFOTA``) and specified as follows:
+
++-------------------------+----------------------------+----------------------------------------------------+
+|``<fota_stage>``         |``<fota_status>``           | ``<fota_info>``                                    |
++=========================+============================+====================================================+
+|``0`` (namely *Init*)    | ``0`` (namely *OK*)        | ``0`` - No update is available                     |
++-------------------------+----------------------------+----------------------------------------------------+
+|``0`` (namely *Init*)    | ``0`` (namely *OK*)        | ``1`` - An update is available (sent only for      |
+|                         |                            |         ``<op>=4`` and ``<op>=6``                  |
++-------------------------+----------------------------+----------------------------------------------------+
+|``0`` (namely *Init*)    | ``1`` (namely *ERROR*)     | Error code                                         |
++-------------------------+----------------------------+----------------------------------------------------+
+
+Examples
+~~~~~~~~
+
+::
+
+  AT#XNRFCLOUDFOTA=1
+
+  OK
+
+  #XNRFCLOUDFOTA: 1,0,45
+
+  #XNRFCLOUDFOTA: 1,0,100
+
+  #XNRFCLOUDFOTA: 4,0
+  AT#XRESET
+
+The following example checks whether an application update is available, without downloading it:
+
+::
+
+  AT#XNRFCLOUDFOTA=4
+
+  OK
+
+  #XNRFCLOUDFOTA: 0,0,1
+
+Read command
+------------
+
+The read command is not supported.
+
+Test command
+------------
+
+The test command returns the supported syntax.
+
+Syntax
+~~~~~~
+
+::
+
+   AT#XNRFCLOUDFOTA=?
+
+Response
+~~~~~~~~
+
+::
+
+   #XNRFCLOUDFOTA: (0,1,2,4,6)[,<project_key>]
+
+.. _SM_AT_NRFCLOUDOBSUPLOAD:
+
+On-demand upload #XNRFCLOUDOBSUPLOAD
+====================================
+
+The ``#XNRFCLOUDOBSUPLOAD`` command uploads the buffered observability data to nRF Cloud.
+
+The captured logs are collected before the upload so that they are included.
+
+Set command
+-----------
+
+The set command uploads the buffered data.
+
+Syntax
+~~~~~~
+
+::
+
+   AT#XNRFCLOUDOBSUPLOAD[=<project_key>]
+
+The command returns ``OK`` immediately and the upload runs asynchronously.
+When it completes, an unsolicited notification is sent.
+
+Unsolicited notification
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+::
+
+   #XNRFCLOUDOBSUPLOAD: <result>[,<bytes>]
+
+The parameters and their defined values are the following:
+
+<result>
+   * ``0`` - Success.
+     The ``<bytes>`` parameter follows and indicates the number of bytes uploaded, which is ``0`` when there was nothing buffered.
+   * ``-1`` - Failure.
+     The error code is shown in the log.
+
+Example
+~~~~~~~
+
+::
+
+  AT#XNRFCLOUDOBSUPLOAD
+
+  OK
+
+  #XNRFCLOUDOBSUPLOAD: 0,108
+
+Read command
+------------
+
+The read command is not supported.
+
+Test command
+------------
+
+The test command returns the supported syntax.
+
+Syntax
+~~~~~~
+
+::
+
+   AT#XNRFCLOUDOBSUPLOAD=?
+
+Response
+~~~~~~~~
+
+::
+
+   #XNRFCLOUDOBSUPLOAD: <project_key>
+
+.. _SM_AT_NRFCLOUDOBSHEARTBEAT:
+
+Metrics heartbeat #XNRFCLOUDOBSHEARTBEAT
+========================================
+
+The ``#XNRFCLOUDOBSHEARTBEAT`` command collects and finalizes a metrics heartbeat.
+
+The data is buffered on the device until it is uploaded, so the command does not require a connection to nRF Cloud.
+
+The heartbeat carries the LTE metrics that the modem reports, such as the modem firmware version, the network operator, RSRP, SNR, the current band, and the transmitted and received data in kilobytes.
+
+.. only:: not nrf91m1
+
+   When :ref:`CONFIG_SM_NRF_CLOUD_OBSERVABILITY_LTE_METRICS <CONFIG_SM_NRF_CLOUD_OBSERVABILITY_LTE_METRICS>` is enabled, the heartbeat also carries the cell ID, the tracking area code, the LTE mode, the PSM active time and periodic TAU, and the eDRX interval and paging time window.
+
+.. only:: nrf91m1
+
+   The heartbeat also carries the cell ID, the tracking area code, the LTE mode, the PSM active time and periodic TAU, and the eDRX interval and paging time window.
+
+The heartbeat additionally carries connection statistics that are tracked between heartbeats, including the time to connect to the network, the number of connection losses, and the time the LTE link has been active.
+Values not reported by the modem, such as when it is deactivated, are excluded from the heartbeat.
+
+Set command
+-----------
+
+The set command collects a heartbeat.
+
+Syntax
+~~~~~~
+
+::
+
+   AT#XNRFCLOUDOBSHEARTBEAT
+
+Example
+~~~~~~~
+
+::
+
+  AT#XNRFCLOUDOBSHEARTBEAT
+
+  OK
+
+Read command
+------------
+
+The read command is not supported.
+
+Test command
+------------
+
+The test command is not supported.
+
+.. _SM_AT_NRFCLOUDOBSFORWARD:
+
+Chunk forwarding #XNRFCLOUDOBSFORWARD
+=====================================
+
+The ``#XNRFCLOUDOBSFORWARD`` command forwards a Memfault chunk produced by the host to nRF Cloud, using the |SM| connection.
+
+.. note::
+   nRF Cloud attributes the chunk to the authenticated device, so the observability data of the host is reported under the device serial of the |SM| device by default.
+   To report it under a device serial of the host instead, build the host firmware with ``MEMFAULT_EVENT_INCLUDE_DEVICE_SERIAL`` set to ``1`` in its :file:`memfault_platform_config.h`.
+   Every chunk then carries the device serial of the host, which Memfault uses to attribute the data.
+
+Set command
+-----------
+
+The set command forwards a chunk.
+
+Syntax
+~~~~~~
+
+::
+
+   AT#XNRFCLOUDOBSFORWARD=<base64_chunk>[,<project_key>]
+
+The parameters and their defined values are the following:
+
+<base64_chunk>
+   String.
+   The base64-encoded Memfault chunk to forward.
+
+The command returns ``OK`` immediately and the chunk is posted asynchronously.
+When the post completes, an unsolicited notification is sent.
+
+Unsolicited notification
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+::
+
+   #XNRFCLOUDOBSFORWARD: <result>
+
+The parameters and their defined values are the following:
+
+<result>
+   * ``0`` - Success.
+   * ``-1`` - Failure.
+     The chunk is not buffered, so the host must send it again to retry.
+
+Example
+~~~~~~~
+
+Forward a chunk of the host, sent to a specific Memfault project::
+
+  AT#XNRFCLOUDOBSFORWARD="CAKnAgIDAQpqdGVzdHNlcmlhbA==","<project_key>"
+
+  OK
+
+  #XNRFCLOUDOBSFORWARD: 0
+
+Read command
+------------
+
+The read command is not supported.
+
+Test command
+------------
+
+The test command returns the supported syntax.
+
+Syntax
+~~~~~~
+
+::
+
+   AT#XNRFCLOUDOBSFORWARD=?
+
+Response
+~~~~~~~~
+
+::
+
+   #XNRFCLOUDOBSFORWARD: <base64_chunk>,<project_key>
+
+.. _SM_AT_NRFCLOUDOBSCOREDUMP:
+
+Core dump upload #XNRFCLOUDOBSCOREDUMP
+======================================
+
+The ``#XNRFCLOUDOBSCOREDUMP`` command controls whether a stored core dump is included in an upload.
+
+When disabled, ``#XNRFCLOUDOBSUPLOAD`` and the automatic upload send the buffered events, logs, and CDRs but leave the core dump in storage, so it can be uploaded later by enabling this again.
+Core dump upload is enabled by default, and the setting is persisted.
+
+.. note::
+
+   Core dump storage holds a single core dump.
+   While a new core dump is stored, subsequent crashes do not capture a new core dump until the stored one has been uploaded.
+   Keeping the upload disabled prevents new core dumps from being captured.
+
+Set command
+-----------
+
+The set command enables or disables the core dump upload.
+
+Syntax
+~~~~~~
+
+::
+
+   AT#XNRFCLOUDOBSCOREDUMP=<enable>
+
+The parameters and their defined values are the following:
+
+<enable>
+   * ``0`` - Exclude the stored core dump from uploads.
+   * ``1`` - Include the stored core dump in uploads.
+
+Read command
+------------
+
+The read command returns the current setting.
+
+Syntax
+~~~~~~
+
+::
+
+   AT#XNRFCLOUDOBSCOREDUMP?
+
+Response
+~~~~~~~~
+
+::
+
+   #XNRFCLOUDOBSCOREDUMP: <enable>
+
+Test command
+------------
+
+The test command returns the supported syntax.
+
+Syntax
+~~~~~~
+
+::
+
+   AT#XNRFCLOUDOBSCOREDUMP=?
+
+Response
+~~~~~~~~
+
+::
+
+   #XNRFCLOUDOBSCOREDUMP: (0,1)
+
+.. _SM_AT_NRFCLOUDOBSAUTO:
+
+Automatic upload #XNRFCLOUDOBSAUTO
+==================================
+
+The ``#XNRFCLOUDOBSAUTO`` command configures the automatic upload of the buffered observability data.
+
+The configuration is persistent, so it survives a reboot.
+
+Set command
+-----------
+
+The set command enables or disables the automatic upload and configures its interval.
+
+Syntax
+~~~~~~
+
+::
+
+   AT#XNRFCLOUDOBSAUTO=<enable>[,<interval_seconds>][,<project_key>]
+
+The parameters and their defined values are the following:
+
+<enable>
+   * ``0`` - Disable the automatic upload.
+   * ``1`` - Enable the automatic upload.
+
+<interval_seconds>
+   Integer.
+   The interval between two uploads, from ``60`` to ``86400`` seconds.
+   When omitted, the stored interval is kept.
+
+   .. only:: not nrf91m1
+
+      The initial value is set by the :ref:`CONFIG_SM_NRF_CLOUD_OBSERVABILITY_AUTO_INTERVAL_SECONDS <CONFIG_SM_NRF_CLOUD_OBSERVABILITY_AUTO_INTERVAL_SECONDS>` Kconfig option.
+
+   .. only:: nrf91m1
+
+      The initial value is 3600 seconds.
+
+<project_key>
+   String.
+   When omitted, the stored project key is kept, and an empty string clears it.
+
+The first upload runs when the interval expires, not when the automatic upload is enabled.
+An upload that falls while there is no connection to nRF Cloud is skipped, and the next one is scheduled as usual.
+
+The automatic upload is silent and does not send any unsolicited notifications.
+
+Response
+~~~~~~~~
+
+The command returns ``OK``, also when the configuration could not be stored, in which case only its persistence is lost.
+
+Read command
+------------
+
+The read command returns the configuration of the automatic upload.
+
+Syntax
+~~~~~~
+
+::
+
+   AT#XNRFCLOUDOBSAUTO?
+
+Response
+~~~~~~~~
+
+::
+
+   #XNRFCLOUDOBSAUTO: <enable>,<interval_seconds>,<project_key>
+
+Example
+~~~~~~~
+
+::
+
+  AT#XNRFCLOUDOBSAUTO=1,600
+
+  OK
+  AT#XNRFCLOUDOBSAUTO?
+
+  #XNRFCLOUDOBSAUTO: 1,600,""
+
+  OK
+
+Test command
+------------
+
+The test command returns the supported syntax.
+
+Syntax
+~~~~~~
+
+::
+
+   AT#XNRFCLOUDOBSAUTO=?
+
+Response
+~~~~~~~~
+
+::
+
+   #XNRFCLOUDOBSAUTO: (0,1),(60-86400),<project_key>
+
+.. only:: not nrf91m1
+
+   .. _SM_AT_NRFCLOUDOBSDEVINFO:
+
+   Memfault device information #XNRFCLOUDOBSDEVINFO
+   ================================================
+
+   The ``#XNRFCLOUDOBSDEVINFO`` command returns the Memfault device information, which identifies the device and the firmware in the Memfault project.
+
+   This command requires the :ref:`CONFIG_SM_NRF_CLOUD_OBSERVABILITY_DEBUG <CONFIG_SM_NRF_CLOUD_OBSERVABILITY_DEBUG>` Kconfig option.
+
+   Set command
+   -----------
+
+   The set command returns the device information.
+
+   Syntax
+   ~~~~~~
+
+   ::
+
+      AT#XNRFCLOUDOBSDEVINFO
+
+   Response
+   ~~~~~~~~
+
+   ::
+
+      #XNRFCLOUDOBSDEVINFO: <device_serial>,<software_type>,<software_version>,<hardware_version>
+
+   The parameters and their defined values are the following:
+
+   <device_serial>
+      String.
+      The device serial.
+
+   <software_type>
+      String.
+      The software type.
+
+   <software_version>
+      String.
+      The software version.
+
+   <hardware_version>
+      String.
+      The hardware version.
+
+   Example
+   ~~~~~~~
+
+   ::
+
+     AT#XNRFCLOUDOBSDEVINFO
+
+     #XNRFCLOUDOBSDEVINFO: "50344654-3037-409f-802d-2206917f23d2","serial_modem","3.4.0","nrf9151dk"
+
+     OK
+
+   Read command
+   ------------
+
+   The read command is not supported.
+
+   Test command
+   ------------
+
+   The test command is not supported.
+
+   .. _SM_AT_NRFCLOUDOBSCRASH:
+
+   Forced crash #XNRFCLOUDOBSCRASH
+   ===============================
+
+   The ``#XNRFCLOUDOBSCRASH`` command forces a crash, so that the coredump capture and upload can be tested.
+
+   This command requires the :ref:`CONFIG_SM_NRF_CLOUD_OBSERVABILITY_DEBUG <CONFIG_SM_NRF_CLOUD_OBSERVABILITY_DEBUG>` Kconfig option.
+
+   Set command
+   -----------
+
+   The set command crashes the application.
+
+   Syntax
+   ~~~~~~
+
+   ::
+
+      AT#XNRFCLOUDOBSCRASH[=<type>]
+
+   The parameters and their defined values are the following:
+
+   <type>
+      Integer.
+      An integer from ``0`` to ``4``.
+      It defaults to ``0``, an assertion failure.
+
+   The device crashes and no response is returned, unless the crash type is invalid.
+
+   Read command
+   ------------
+
+   The read command is not supported.
+
+   Test command
+   ------------
+
+   The test command returns the supported syntax.
+
+   Syntax
+   ~~~~~~
+
+   ::
+
+      AT#XNRFCLOUDOBSCRASH=?
+
+   Response
+   ~~~~~~~~
+
+   ::
+
+      #XNRFCLOUDOBSCRASH: <type>
+
+   .. _SM_AT_NRFCLOUDOBSEXPORT:
+
+   Chunk export #XNRFCLOUDOBSEXPORT
+   ================================
+
+   The ``#XNRFCLOUDOBSEXPORT`` command prints the buffered Memfault chunks to the AT interface instead of uploading them in the Memfault chunk export format, which the Memfault tooling can parse.
+
+   This command requires the :ref:`CONFIG_SM_NRF_CLOUD_OBSERVABILITY_DEBUG <CONFIG_SM_NRF_CLOUD_OBSERVABILITY_DEBUG>` Kconfig option.
+
+   .. note::
+      The command consumes the chunks.
+      They are no longer available for ``#XNRFCLOUDOBSUPLOAD`` and the automatic upload.
+
+   Set command
+   -----------
+
+   The set command prints the buffered chunks.
+
+   Syntax
+   ~~~~~~
+
+   ::
+
+      AT#XNRFCLOUDOBSEXPORT
+
+   Response
+   ~~~~~~~~
+
+   The buffered chunks are returned, one per line::
+
+      MC:<base64_chunk>:
+
+   Example
+   ~~~~~~~
+
+   ::
+
+     AT#XNRFCLOUDOBSHEARTBEAT
+
+     OK
+     AT#XNRFCLOUDOBSEXPORT
+
+     MC:CAKnAgIDAQpqdGVzdHNlcmlhbA==:
+
+     OK
+
+   Read command
+   ------------
+
+   The read command is not supported.
+
+   Test command
+   ------------
+
+   The test command is not supported.

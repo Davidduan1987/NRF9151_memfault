@@ -1,0 +1,38 @@
+# Copyright (c) 2025 Nordic Semiconductor
+# SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+
+manifest:
+  self:
+    import: submanifests
+
+  remotes:
+    - name: ncs
+      url-base: https://github.com/nrfconnect
+
+  projects:
+    - name: nrf
+      remote: ncs
+      repo-path: sdk-nrf
+      revision: v3.4.1
+      import:
+        name-allowlist:
+          - cjson
+          - cmsis_6
+          - cmock
+          - hal_nordic
+          - libmodem
+          - mbedtls
+          - mcuboot
+          - nrfxlib
+          - oberon-psa-crypto
+          - segger
+          - tf-psa-crypto
+          - trusted-firmware-m
+          - zcbor
+          - zephyr
+          - littlefs
+
+    - name: memfault-firmware-sdk
+      url: https://github.com/memfault/memfault-firmware-sdk
+      path: modules/lib/memfault-firmware-sdk
+      revision: 1.45.0

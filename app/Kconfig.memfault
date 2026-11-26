@@ -1,0 +1,212 @@
+#
+# Copyright (c) 2026 Nordic Semiconductor ASA
+#
+# SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+#
+
+# Application defaults for nRF Cloud observability and FOTA, i.e., Memfault features.
+#
+# This file must be sourced before Kconfig.zephyr, which is what pulls in the Kconfig of
+# the Memfault module: a default is inserted at the position where it appears relative to
+# the definition of the symbol, and the first matching default wins. Sourced afterwards,
+# every default here would silently lose to the one of the module.
+
+# Enable Memfault when the observability or FOTA features are on.
+# Disable explicitly with CONFIG_MEMFAULT=n (no_memfault build), or automatically when both
+# SM_NRF_CLOUD_OBSERVABILITY and SM_NRF_CLOUD_FOTA are disabled.
+# Note: SM_NRF_CLOUD_OBSERVABILITY and SM_NRF_CLOUD_FOTA intentionally do not depend on
+# MEMFAULT or MEMFAULT_USE_NRF_CLOUD_COAP. Those dependencies would be circular here.
+# MEMFAULT_USE_NRF_CLOUD_COAP is enabled via its own configdefault below once MEMFAULT=y.
+configdefault MEMFAULT
+	default y if SM_NRF_CLOUD_OBSERVABILITY || SM_NRF_CLOUD_FOTA
+
+config SM_NRF_CLOUD_OBSERVABILITY
+	bool "nRF Cloud observability AT commands"
+	default y
+	depends on SM_NRF_CLOUD
+	select BASE64
+	help
+	  Enable the AT#XNRFCLOUDOBS* commands, which control Memfault
+	  over the nRF Cloud CoAP transport.
+
+config SM_NRF_CLOUD_OBSERVABILITY_AUTO_INTERVAL_SECONDS
+	int "Default interval of the automatic upload"
+	depends on SM_NRF_CLOUD_OBSERVABILITY
+	default 3600
+	range 60 86400
+	help
+	  Interval used by AT#XNRFCLOUDOBSAUTO when the host enables the
+	  automatic upload without giving one, and no interval has been stored
+	  yet. The interval the host gives is persistent, so this value only
+	  applies until the host configures one.
+
+config SM_NRF_CLOUD_OBSERVABILITY_DEBUG
+	bool "Debug nRF Cloud observability AT commands"
+	depends on SM_NRF_CLOUD_OBSERVABILITY
+	help
+	  Enable the debug observability commands:
+
+	  * AT#XNRFCLOUDOBSDEVINFO returns the Memfault device information.
+	  * AT#XNRFCLOUDOBSCRASH forces a crash so that coredump capture and
+	    upload can be tested.
+	  * AT#XNRFCLOUDOBSEXPORT prints the buffered Memfault chunks to the AT
+	    interface instead of uploading them.
+
+	  This is disabled by default: AT#XNRFCLOUDOBSCRASH deliberately crashes
+	  the application, so enable it only in development builds.
+
+config SM_NRF_CLOUD_OBSERVABILITY_LTE_METRICS
+	bool "Collect additional LTE metrics via AT commands for Memfault"
+	depends on MEMFAULT
+	depends on MEMFAULT_NCS_LTE_METRICS
+	depends on SM_NRF_CLOUD_OBSERVABILITY
+	default y
+	help
+	  Collect cell ID, tracking area code, LTE mode, PSM (TAU and active time) and
+	  eDRX (interval and paging time window) metrics on each Memfault heartbeat.
+	  Also track time to connect, connection-loss count, and LTE on-time.
+
+config SM_PC_MODEM_TRACE_UPLOAD
+	bool "Button-triggered modem trace upload"
+	depends on SM_NRF_CLOUD_OBSERVABILITY && MEMFAULT && GPIO
+	depends on NRF_MODEM_LIB_TRACE_BACKEND_FLASH
+	depends on NRF_MODEM_TRACE_FLASH_NOSPACE_ERASE_OLDEST
+	depends on MEMFAULT_CDR_ENABLE
+	help
+	  Freeze the modem trace on Button 1 and upload it as a Memfault CDR
+	  after the host reconnects the modem and nRF Cloud.
+
+config SM_NRF_CLOUD_FOTA
+	bool "nRF Cloud FOTA AT commands"
+	default y
+	depends on SM_NRF_CLOUD
+	help
+	  Enable the AT#XNRFCLOUDFOTA* commands, which check for and download
+	  application and modem firmware updates via Memfault release
+	  management (https://mflt.io/release-mgmt), delivered over the same
+	  nRF Cloud CoAP transport as AT#XNRFCLOUDOBS*.
+
+# Report a statically configured firmware version. A choice symbol cannot be given a
+# configdefault, which warns that it has no effect, so the default of the choice itself is
+# overridden instead. Assigning the symbol in prj.conf would warn with CONFIG_MEMFAULT=n.
+choice MEMFAULT_FW_VERSION
+	default MEMFAULT_NCS_FW_VERSION_STATIC
+endchoice
+
+configdefault MEMFAULT_LOGGING_ENABLE
+	default y
+
+# The whole buffer is a static RAM array captured via .bss regardless of how much of it is in use.
+configdefault MEMFAULT_LOGGING_RAM_SIZE
+	default 4096 if $(dt_nodelabel_exists,memfault_coredump_partition)
+
+# Return from the fault handler to allow Zephyr's default fatal error handler to take over.
+configdefault MEMFAULT_FAULT_HANDLER_RETURN
+	default y
+
+configdefault MEMFAULT_RAM_BACKED_COREDUMP_SIZE
+	default 4096
+
+# The flash-backed coredump is enabled automatically when the board's devicetree defines a
+# memfault_coredump_partition falling back to a RAM-backed coredump otherwise.
+configdefault MEMFAULT_NCS_INTERNAL_FLASH_BACKED_COREDUMP
+	default y if $(dt_nodelabel_exists,memfault_coredump_partition)
+
+# Crashing thread benefits from a deep stack capture.
+configdefault MEMFAULT_COREDUMP_ACTIVE_TASK_STACK_SIZE_TO_COLLECT
+	default 2048 if $(dt_nodelabel_exists,memfault_coredump_partition)
+
+# The ~13 other blocked / idle threads need to show a couple of frames to tell
+# what the thread was waiting on.
+configdefault MEMFAULT_COREDUMP_STACK_SIZE_TO_COLLECT
+	default 256
+
+configdefault MEMFAULT_COREDUMP_MAX_TRACKED_TASKS
+	default 16
+
+# Disable .data collection.
+configdefault MEMFAULT_COREDUMP_COLLECT_DATA_REGIONS
+	default n
+
+# Collect heap statistics in coredumps.
+configdefault MEMFAULT_HEAP_STATS
+	default y
+
+# Upload Memfault data via the nRF Cloud CoAP transport.
+configdefault MEMFAULT_USE_NRF_CLOUD_COAP
+	default y
+
+configdefault MEMFAULT_HTTP_ENABLE
+	default n
+
+# The periodic upload port is not used: AT#XNRFCLOUDOBSAUTO implements the automatic upload
+# itself, with an interval that the host can change, and every other upload is host-driven
+# with AT#XNRFCLOUDOBSUPLOAD.
+configdefault MEMFAULT_PERIODIC_UPLOAD
+	default n
+
+# Enabled by SM_NRF_CLOUD_FOTA (AT#XNRFCLOUDFOTA*); no backend is wired up otherwise.
+configdefault MEMFAULT_ZEPHYR_FOTA
+	default y if SM_NRF_CLOUD_FOTA
+	default n
+
+configdefault MEMFAULT_FOTA_DOWNLOAD_CALLBACK_CUSTOM
+	default y if SM_NRF_CLOUD_FOTA
+
+configdefault MEMFAULT_FOTA_MODEM_UPDATE
+	default y if SM_NRF_CLOUD_FOTA
+
+configdefault NRF_CLOUD_FOTA_POLL
+	default y if SM_NRF_CLOUD_FOTA
+
+# Collect metrics for unused stack space.
+configdefault MEMFAULT_NCS_STACK_METRICS
+	default n
+
+# Collect the LTE metrics that MODEM_INFO provides: modem firmware version, operator, RSRP,
+# SNR, band and the connectivity statistics. The remaining LTE metrics are collected via
+# AT commands in sm_at_nrfcloud_obs_lte_metrics.c.
+configdefault MEMFAULT_NCS_LTE_METRICS
+	default y
+
+configdefault MEMFAULT_USER_CONFIG_ENABLE
+	default y if SM_NRF_CLOUD_OBSERVABILITY_LTE_METRICS
+
+configdefault MEMFAULT_NCS_IMPLEMENT_METRICS_COLLECTION
+	default n if SM_NRF_CLOUD_OBSERVABILITY_LTE_METRICS
+
+# Memfault depends on POSIX, disable unneeded POSIX features.
+configdefault POSIX_FILE_SYSTEM
+	default n if MEMFAULT
+
+# The Memfault CoAP port (memfault_platform_coap.c) allocates the packetizer buffer with
+# k_calloc, and it fails to build unless CONFIG_HEAP_MEM_POOL_SIZE is greater than zero. A
+# HEAP_MEM_POOL_ADD_SIZE_* option is not enough, because the port tests this symbol
+# directly. Zephyr uses the greater of this value and the sum of the
+# HEAP_MEM_POOL_ADD_SIZE_* options, so this does not shrink the pool of other subsystems.
+configdefault HEAP_MEM_POOL_SIZE
+	default 4096 if MEMFAULT
+
+# MEMFAULT_USE_NRF_CLOUD_COAP requires at least two user CoAP options (the project key for
+# the chunks resource, and PROXY_URI plus the project key for the proxy resource), an
+# extended options length value of at least 192, and room for four extra CoAP client
+# options.
+configdefault NRF_CLOUD_COAP_MAX_USER_OPTIONS
+	default 2 if MEMFAULT
+
+configdefault COAP_EXTENDED_OPTIONS_LEN_VALUE
+	default 192 if MEMFAULT
+	default 96
+
+configdefault COAP_CLIENT_MAX_EXTRA_OPTIONS
+	default 4 if MEMFAULT
+
+configdefault COAP_CLIENT_MAX_PATH_LENGTH
+	default 160 if MEMFAULT_USE_NRF_CLOUD_COAP
+
+# The larger CoAP options above (COAP_EXTENDED_OPTIONS_LEN_VALUE and
+# COAP_CLIENT_MAX_EXTRA_OPTIONS) enlarge struct coap_client_request, which the
+# nRF Provisioning thread builds on its stack in send_coap_request(),
+# so the stack size must be increased to accommodate it.
+configdefault NRF_PROVISIONING_STACK_SIZE
+	default 2560 if MEMFAULT

@@ -1,0 +1,275 @@
+/*
+ * Copyright (c) 2026 Nordic Semiconductor ASA
+ *
+ * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+ */
+
+/* Intercept AT+CEREG / AT+CGEREP / AT%XTIME and filter +CEREG / +CGEV / %XTIME URC
+ * forwarding so internal users (Memfault, PPP, date_time, etc.) stay subscribed
+ * while the host can opt out.
+ */
+
+#include "sm_at_host.h"
+#include "sm_defines.h"
+#include <errno.h>
+#include <modem/at_cmd_custom.h>
+#include <modem/at_monitor.h>
+#include <modem/lte_lc.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <strings.h>
+#include <zephyr/logging/log.h>
+#if IS_ENABLED(CONFIG_SM_NRF_CLOUD_OBSERVABILITY_LTE_METRICS)
+#include "sm_at_nrfcloud_obs_lte_metrics.h"
+#endif
+
+int sm_util_at_cmd_no_intercept(char *buf, size_t len, const char *at_cmd);
+
+LOG_MODULE_REGISTER(sm_urcf, CONFIG_SM_LOG_LEVEL);
+
+#define SM_AT_CEREG_INTERNAL_MODE 1
+
+STATIC bool sm_urcf_fwd_cereg;
+STATIC bool sm_urcf_fwd_cgev;
+STATIC bool sm_urcf_fwd_xtime;
+
+/* Host-requested +CEREG notification mode, cleared by CFUN=0 like the modem does. */
+STATIC uint8_t sm_urcf_host_cereg_mode;
+
+AT_CMD_CUSTOM(sm_urcf_cereg_interceptor, "AT+CEREG", sm_urcf_cereg_callback);
+AT_CMD_CUSTOM(sm_urcf_cgerep_interceptor, "AT+CGEREP", sm_urcf_cgerep_callback);
+AT_CMD_CUSTOM(sm_urcf_xtime_interceptor, "AT%XTIME", sm_urcf_xtime_callback);
+AT_CMD_CUSTOM(sm_urcf_cfun_interceptor, "AT+CFUN=", sm_urcf_cfun_callback);
+
+static void sm_urcf_cereg_subscribe(void)
+{
+	char buf[sizeof("\r\nOK")];
+	char cmd[sizeof("AT+CEREG=255")];
+	uint8_t mode = sm_urcf_host_cereg_mode > SM_AT_CEREG_INTERNAL_MODE
+			       ? sm_urcf_host_cereg_mode
+			       : SM_AT_CEREG_INTERNAL_MODE;
+	int ret;
+
+	snprintf(cmd, sizeof(cmd), "AT+CEREG=%hhu", mode);
+	ret = sm_util_at_cmd_no_intercept(buf, sizeof(buf), cmd);
+	if (ret) {
+		LOG_ERR("Subscribe to %s failed: %d", "+CEREG", ret);
+	}
+}
+
+static void sm_urcf_cgerep_subscribe(void)
+{
+	char buf[sizeof("\r\nOK")];
+	int ret;
+
+	ret = sm_util_at_cmd_no_intercept(buf, sizeof(buf), "AT+CGEREP=1");
+	if (ret) {
+		LOG_ERR("Subscribe to %s failed: %d", "+CGEV", ret);
+	}
+}
+
+static void sm_urcf_xtime_subscribe(void)
+{
+	char buf[sizeof("\r\nOK")];
+	int ret;
+
+	ret = sm_util_at_cmd_no_intercept(buf, sizeof(buf), "AT%XTIME=1");
+	if (ret) {
+		LOG_ERR("Subscribe to %s failed: %d", "%XTIME", ret);
+	}
+}
+
+static void sm_urcf_on_cfun(unsigned int mode)
+{
+	if (mode == LTE_LC_FUNC_MODE_NORMAL || mode == LTE_LC_FUNC_MODE_ACTIVATE_LTE) {
+		sm_urcf_cgerep_subscribe();
+		sm_urcf_cereg_subscribe();
+		sm_urcf_xtime_subscribe();
+	} else if (mode == LTE_LC_FUNC_MODE_POWER_OFF) {
+		sm_urcf_fwd_cgev = false;
+		sm_urcf_fwd_cereg = false;
+		sm_urcf_fwd_xtime = false;
+		sm_urcf_host_cereg_mode = 0;
+	}
+
+#if IS_ENABLED(CONFIG_SM_NRF_CLOUD_OBSERVABILITY_LTE_METRICS)
+	sm_memfault_lte_metrics_on_cfun(mode);
+#endif
+}
+
+STATIC int sm_urcf_cereg_callback(char *buf, size_t len, char *at_cmd)
+{
+	int ret;
+	unsigned int mode = 0;
+	const bool set_cmd = (sscanf(at_cmd, "%*[^=]=%u", &mode) == 1);
+
+	if (!set_cmd && (!strcasecmp(at_cmd, "AT+CEREG") || !strcasecmp(at_cmd, "AT+CEREG="))) {
+		LOG_ERR("Syntax %s disallowed, use %s instead", at_cmd, "AT+CEREG=0");
+		return -EINVAL;
+	}
+
+	if (!set_cmd || mode != 0) {
+		ret = sm_util_at_cmd_no_intercept(buf, len, at_cmd);
+		if (ret) {
+			return ret;
+		}
+
+		if (at_cmd[strlen("AT+CEREG")] == '?' && !sm_urcf_fwd_cereg) {
+			const size_t mode_idx = strlen("+CEREG: ");
+
+			if (mode_idx < strlen(buf)) {
+				buf[mode_idx] = '0';
+			}
+		}
+	} else { /* AT+CEREG=0 */
+		snprintf(buf, len, "%s", "OK\r\n");
+	}
+
+	if (set_cmd) {
+		sm_urcf_host_cereg_mode = mode;
+		sm_urcf_fwd_cereg = (mode != 0);
+	}
+
+	return 0;
+}
+
+STATIC int sm_urcf_cgerep_callback(char *buf, size_t len, char *at_cmd)
+{
+	int ret;
+	unsigned int subscribe = 0;
+	const bool set_cmd = (sscanf(at_cmd, "%*[^=]=%u", &subscribe) == 1);
+
+	if (!set_cmd && (!strcasecmp(at_cmd, "AT+CGEREP") || !strcasecmp(at_cmd, "AT+CGEREP="))) {
+		LOG_ERR("Syntax %s disallowed, use %s instead", at_cmd, "AT+CGEREP=0");
+		return -EINVAL;
+	}
+
+	if (!set_cmd || subscribe) {
+		ret = sm_util_at_cmd_no_intercept(buf, len, at_cmd);
+		if (ret) {
+			return ret;
+		}
+
+		if (at_cmd[strlen("AT+CGEREP")] == '?') {
+			const size_t mode_idx = strlen("+CGEREP: ");
+
+			if (mode_idx < strlen(buf)) {
+				buf[mode_idx] = '0' + sm_urcf_fwd_cgev;
+			}
+		}
+	} else { /* AT+CGEREP=0 */
+		snprintf(buf, len, "%s", "OK\r\n");
+	}
+
+	if (set_cmd) {
+		sm_urcf_fwd_cgev = (subscribe != 0);
+	}
+
+	return 0;
+}
+
+STATIC int sm_urcf_xtime_callback(char *buf, size_t len, char *at_cmd)
+{
+	int ret;
+	unsigned int subscribe = 0;
+	const bool set_cmd = (sscanf(at_cmd, "%*[^=]=%u", &subscribe) == 1);
+
+	if (!set_cmd && (!strcasecmp(at_cmd, "AT%XTIME") || !strcasecmp(at_cmd, "AT%XTIME="))) {
+		LOG_ERR("Syntax %s disallowed, use %s instead", at_cmd, "AT%XTIME=0");
+		return -EINVAL;
+	}
+
+	if (!set_cmd || subscribe) {
+		ret = sm_util_at_cmd_no_intercept(buf, len, at_cmd);
+		if (ret) {
+			return ret;
+		}
+
+		if (at_cmd[strlen("AT%XTIME")] == '?') {
+			const size_t mode_idx = strlen("%XTIME: ");
+
+			if (mode_idx < strlen(buf)) {
+				buf[mode_idx] = '0' + sm_urcf_fwd_xtime;
+			}
+		}
+	} else { /* AT%XTIME=0 */
+		snprintf(buf, len, "%s", "OK\r\n");
+	}
+
+	if (set_cmd) {
+		sm_urcf_fwd_xtime = (subscribe != 0);
+	}
+
+	return 0;
+}
+
+STATIC int sm_urcf_cfun_callback(char *buf, size_t len, char *at_cmd)
+{
+	unsigned int mode;
+	const bool set_cmd = (sscanf(at_cmd, "%*[^=]=%u", &mode) == 1);
+	int ret;
+
+#if IS_ENABLED(CONFIG_SM_NRF_CLOUD_OBSERVABILITY_LTE_METRICS)
+	if (set_cmd) {
+		/* Arm before forwarding: the modem may emit +CEREG: 0 while it processes
+		 * the deactivation, i.e. before this command returns.
+		 */
+		sm_memfault_lte_metrics_on_cfun_request(mode);
+	}
+#endif
+
+	ret = sm_util_at_cmd_no_intercept(buf, len, at_cmd);
+	if (ret) {
+#if IS_ENABLED(CONFIG_SM_NRF_CLOUD_OBSERVABILITY_LTE_METRICS)
+		if (set_cmd) {
+			/* Command rejected; clear any armed deactivation. */
+			sm_memfault_lte_metrics_on_cfun_request(LTE_LC_FUNC_MODE_NORMAL);
+		}
+#endif
+		return ret;
+	}
+
+	if (set_cmd) {
+		sm_urcf_on_cfun(mode);
+	}
+
+	return 0;
+}
+
+STATIC bool sm_urcf_should_forward(const char *notification)
+{
+	if (!sm_urcf_fwd_cgev && !strncmp(notification, "+CGEV: ", strlen("+CGEV: "))) {
+		return false;
+	}
+
+	if (!sm_urcf_fwd_cereg && !strncmp(notification, "+CEREG: ", strlen("+CEREG: "))) {
+		return false;
+	}
+
+	if (!sm_urcf_fwd_xtime && !strncmp(notification, "%XTIME:", strlen("%XTIME:"))) {
+		return false;
+	}
+
+	return true;
+}
+
+AT_MONITOR(sm_urcf_notify, ANY, sm_urcf_notification_handler);
+
+static void sm_urcf_notification_handler(const char *notification)
+{
+#if IS_ENABLED(CONFIG_SM_NRF_CLOUD_OBSERVABILITY_LTE_METRICS)
+	unsigned int reg_status;
+
+	/* <stat> is the first parameter of the +CEREG URC in every notification mode. */
+	if (sscanf(notification, "+CEREG: %u", &reg_status) == 1) {
+		sm_memfault_lte_metrics_on_cereg(reg_status);
+	}
+#endif
+
+	if (!sm_urcf_should_forward(notification)) {
+		return;
+	}
+
+	urc_send(CRLF_STR "%s", notification);
+}

@@ -1,0 +1,951 @@
+/*
+ * Copyright (c) 2021 Nordic Semiconductor ASA
+ *
+ * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+ */
+
+#include <zephyr/kernel.h>
+#include <assert.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <zephyr/logging/log.h>
+#include <zephyr/sys_clock.h>
+#include <date_time.h>
+#include <nrf_modem_gnss.h>
+#include <modem/nrf_modem_lib.h>
+
+#if defined(CONFIG_SM_NRF_CLOUD)
+#include <net/nrf_cloud.h>
+#include <net/nrf_cloud_codec.h>
+#include <net/nrf_cloud_coap.h>
+#include "sm_at_nrfcloud.h"
+
+#if defined(CONFIG_NRF_CLOUD_AGNSS)
+#include <net/nrf_cloud_agnss.h>
+#endif
+
+#if defined(CONFIG_NRF_CLOUD_PGPS)
+#include <net/nrf_cloud_pgps.h>
+static void pgps_event_handler(struct nrf_cloud_pgps_event *event);
+#endif
+
+#endif /* CONFIG_SM_NRF_CLOUD */
+
+#if defined(CONFIG_SM_CARRIER)
+#include <time.h>
+#include <lwm2m_carrier.h>
+#endif
+
+#include "sm_util.h"
+#include "sm_at_host.h"
+#include "sm_defines.h"
+
+LOG_MODULE_REGISTER(sm_gnss, CONFIG_SM_LOG_LEVEL);
+
+#define LOCATION_REPORT_MS 5000
+
+/* (6.1.1980 UTC - 1.1.1970 UTC) */
+#define GPS_TO_UNIX_UTC_OFFSET_SECONDS	(315964800UL)
+/* UTC/GPS time offset as of 1st of January 2017. */
+#define GPS_TO_UTC_LEAP_SECONDS	(18UL)
+
+/** #XGNSS operations. */
+enum sm_gnss_operation {
+	GNSS_STOP,
+	GNSS_START,
+};
+
+#if defined(CONFIG_SM_NRF_CLOUD)
+
+#if defined(CONFIG_NRF_CLOUD_AGNSS)
+static struct k_work agnss_req_work;
+
+#if defined(CONFIG_SM_NRF_CLOUD_LOCATION)
+static K_SEM_DEFINE(agnss_ncellmeas_sem, 0, 1);
+static struct lte_lc_cells_info *agnss_net_info;
+#endif /* CONFIG_SM_NRF_CLOUD_LOCATION */
+#endif /* CONFIG_SM_NRF_CLOUD */
+
+#if defined(CONFIG_NRF_CLOUD_PGPS)
+static struct k_work pgps_req_work;
+static struct k_work pgps_coap_req_work;
+static struct gps_pgps_request pgps_coap_request;
+#endif
+
+#endif /* CONFIG_SM_NRF_CLOUD */
+
+static struct k_work gnss_fix_send_work;
+
+static int64_t gnss_ttff_start;
+
+static bool gnss_running;
+static enum gnss_status {
+	GNSS_STATUS_STOPPED,
+	GNSS_STATUS_STARTED,
+	GNSS_STATUS_PERIODIC_WAKEUP,
+	GNSS_STATUS_SLEEP_AFTER_TIMEOUT,
+	GNSS_STATUS_SLEEP_AFTER_FIX,
+} gnss_status;
+
+static struct k_work gnss_status_notify_work;
+/* FIFO to pass the GNSS statuses to the notifier worker. */
+K_FIFO_DEFINE(gnss_status_fifo);
+
+static struct modem_pipe *gnss_pipe;
+
+/* Whether to use the nRF Cloud assistive services that were compiled in (A-GNSS/P-GPS).
+ * If enabled, the connection to nRF Cloud is required during GNSS startup
+ * and assistance data will be downloaded.
+ * If disabled, no request will be made to nRF Cloud but leftover assistance
+ * data will still be injected if available locally.
+ */
+static uint16_t gnss_cloud_assistance;
+
+/* If true, indicates that the NRF_MODEM_GNSS_EVT_AGNSS_REQ event
+ * was received and ignored due to cloud assistance being disabled.
+ * It has been observed that the event is not sent again after a restart of GNSS, so
+ * this is to remember that A/P-GPS data was requested if cloud assistance gets enabled.
+ */
+static bool gnss_gps_req_to_send;
+
+static bool is_gnss_activated(void)
+{
+	int activated = 0;
+	int cfun_mode = 0;
+
+	/*parse %XSYSTEMMODE=<LTE_M_support>,<NB_IoT_support>,<GNSS_support>,<LTE_preference> */
+	if (sm_util_at_scanf("AT%XSYSTEMMODE?",
+			       "%%XSYSTEMMODE: %*d,%*d,%d", &activated) == 1) {
+		if (activated == 0) {
+			return false;
+		}
+	}
+
+	/*parse +CFUN: <fun> */
+	if (sm_util_at_scanf("AT+CFUN?", "+CFUN: %d", &cfun_mode) == 1) {
+		if (cfun_mode == 1 || cfun_mode == 31) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static void gnss_status_notifier(struct k_work *)
+{
+	while (!k_fifo_is_empty(&gnss_status_fifo)) {
+		gnss_status = (enum gnss_status)k_fifo_get(&gnss_status_fifo, K_NO_WAIT);
+		urc_send_to(gnss_pipe, "\r\n#XGNSS: 1,%d\r\n", gnss_status);
+	}
+}
+
+static void gnss_status_set(enum gnss_status status)
+{
+	/* A notification is sent when the GNSS status is updated.
+	 * However this gets called in interrupt context (from gnss_event_handler()),
+	 * from which UART messages cannot be sent. This task is thus delegated
+	 * to a worker, to which the new GNSS status is passed.
+	 * A FIFO rather than a single variable is used to not miss GNSS status changes
+	 * in case they happen twice (or more) before the worker had the time to process them.
+	 */
+	const int put_ret = k_fifo_alloc_put(&gnss_status_fifo, (void *)status);
+
+	if (put_ret == 0) {
+		k_work_submit_to_queue(&sm_work_q, &gnss_status_notify_work);
+	} else {
+		LOG_ERR("Failed to set GNSS status to %d: %d", status, put_ret);
+	}
+}
+
+#if defined(CONFIG_SM_NRF_CLOUD) && defined(CONFIG_NRF_CLOUD_AGNSS)
+
+static int64_t utc_to_gps_sec(const int64_t utc_sec)
+{
+	return (utc_sec - GPS_TO_UNIX_UTC_OFFSET_SECONDS) + GPS_TO_UTC_LEAP_SECONDS;
+}
+
+static void gps_sec_to_day_time(int64_t gps_sec, uint16_t *gps_day, uint32_t *gps_time_of_day)
+{
+	*gps_day = (uint16_t)(gps_sec / SEC_PER_DAY);
+	*gps_time_of_day = (uint32_t)(gps_sec % SEC_PER_DAY);
+}
+#endif
+
+static void on_gnss_evt_agnss_req(void)
+{
+	if (!gnss_cloud_assistance) {
+		gnss_gps_req_to_send = true;
+		return;
+	}
+	gnss_gps_req_to_send = false;
+
+#if defined(CONFIG_SM_NRF_CLOUD)
+
+#if defined(CONFIG_NRF_CLOUD_AGNSS)
+	k_work_submit_to_queue(&sm_work_q, &agnss_req_work);
+#endif
+#if defined(CONFIG_NRF_CLOUD_PGPS)
+	k_work_submit_to_queue(&sm_work_q, &pgps_req_work);
+#endif
+
+#endif /* CONFIG_SM_NRF_CLOUD */
+}
+
+static int gnss_startup(void)
+{
+	int ret;
+
+#if defined(CONFIG_SM_NRF_CLOUD)
+
+#if defined(CONFIG_NRF_CLOUD_AGNSS)
+	if (gnss_cloud_assistance) {
+		int64_t utc_now_ms;
+
+#if defined(CONFIG_NRF_CLOUD_AGNSS_FILTERED)
+		ret = nrf_modem_gnss_elevation_threshold_set(
+					CONFIG_NRF_CLOUD_AGNSS_ELEVATION_MASK);
+		if (ret) {
+			LOG_ERR("Failed to set elevation threshold: %d", ret);
+			return ret;
+		}
+#endif
+		if (!date_time_now(&utc_now_ms)) {
+			/* Inject current time into GNSS. If there is valid cached A-GNSS data,
+			 * the modem will not request new almanacs/ephemerides from the cloud.
+			 */
+			const int64_t gps_sec = utc_to_gps_sec(utc_now_ms / 1000);
+			struct nrf_modem_gnss_agnss_gps_data_system_time_and_sv_tow gps_time = {0};
+
+			gps_sec_to_day_time(gps_sec, &gps_time.date_day, &gps_time.time_full_s);
+			ret = nrf_modem_gnss_agnss_write(&gps_time, sizeof(gps_time),
+					NRF_MODEM_GNSS_AGNSS_GPS_SYSTEM_CLOCK_AND_TOWS);
+			if (ret) {
+				LOG_WRN("Failed to inject GNSS time: %d", ret);
+			} else {
+				LOG_INF("GNSS time injected day=%u time=%u",
+					gps_time.date_day, gps_time.time_full_s);
+			}
+		}
+	}
+#endif /* CONFIG_NRF_CLOUD_AGNSS */
+
+#if defined(CONFIG_NRF_CLOUD_PGPS)
+	if (gnss_cloud_assistance) {
+		struct nrf_cloud_pgps_init_param param = {
+			.event_handler = pgps_event_handler,
+			/* Storage is defined by CONFIG_NRF_CLOUD_PGPS_STORAGE. */
+			.storage_base = 0u,
+			.storage_size = 0u
+		};
+
+		/* This will automatically download P-GPS data
+		 * from the cloud in case any is missing.
+		 */
+		ret = nrf_cloud_pgps_init(&param);
+		if (ret) {
+			LOG_ERR("P-GPS init failed: %d", ret);
+			return ret;
+		}
+	}
+#endif
+
+#endif /* CONFIG_SM_NRF_CLOUD */
+
+#if defined(CONFIG_SM_LOG_LEVEL_DBG)
+	uint16_t nmea_mask = NRF_MODEM_GNSS_NMEA_GGA_MASK
+			     | NRF_MODEM_GNSS_NMEA_GLL_MASK
+			     | NRF_MODEM_GNSS_NMEA_RMC_MASK;
+
+#if defined(CONFIG_SM_GNSS_OUTPUT_NMEA_SATELLITES)
+	ret = nrf_modem_gnss_qzss_nmea_mode_set(NRF_MODEM_GNSS_QZSS_NMEA_MODE_CUSTOM);
+	if (ret) {
+		LOG_ERR("Failed to set QZSS NMEA mode: %d", ret);
+	}
+	nmea_mask |= NRF_MODEM_GNSS_NMEA_GSV_MASK | NRF_MODEM_GNSS_NMEA_GSA_MASK;
+#endif
+
+	ret = nrf_modem_gnss_nmea_mask_set(nmea_mask);
+	if (ret < 0) {
+		LOG_ERR("Failed to set NMEA mask: %d", ret);
+		return ret;
+	}
+#endif /* CONFIG_SM_LOG_LEVEL_DBG */
+
+	ret = nrf_modem_gnss_start();
+	if (ret) {
+		LOG_ERR("Failed to start GNSS: %d", ret);
+		return ret;
+	}
+	gnss_running = true;
+	gnss_ttff_start = k_uptime_get();
+	gnss_status_set(GNSS_STATUS_STARTED);
+	LOG_INF("GNSS started with%s cloud assistance", gnss_cloud_assistance ? "" : "out");
+
+	if (gnss_gps_req_to_send) {
+		on_gnss_evt_agnss_req();
+	}
+	return 0;
+}
+
+static int gnss_shutdown(void)
+{
+	const int ret = nrf_modem_gnss_stop();
+
+	if (ret) {
+		LOG_ERR("Failed to stop GNSS: %d", ret);
+		return ret;
+	}
+	gnss_status_set(GNSS_STATUS_STOPPED);
+	gnss_running = false;
+
+	return 0;
+}
+
+#if defined(CONFIG_SM_NRF_CLOUD)
+
+#if defined(CONFIG_NRF_CLOUD_AGNSS) || defined(CONFIG_NRF_CLOUD_PGPS)
+static int read_agnss_req(struct nrf_modem_gnss_agnss_data_frame *req)
+{
+	int err;
+
+	err = nrf_modem_gnss_read((void *)req, sizeof(*req),
+					NRF_MODEM_GNSS_DATA_AGNSS_REQ);
+	if (err) {
+		return err;
+	}
+
+	LOG_DBG("A-GNSS req: ephe=0x%08x alm=0x%08x flags=0x%08x",
+		(uint32_t)req->system[0].sv_mask_ephe,
+		(uint32_t)req->system[0].sv_mask_alm,
+		req->data_flags);
+
+	return 0;
+}
+#endif /* CONFIG_NRF_CLOUD_AGNSS || CONFIG_NRF_CLOUD_PGPS */
+
+#if defined(CONFIG_NRF_CLOUD_AGNSS)
+
+#if defined(CONFIG_SM_NRF_CLOUD_LOCATION)
+static void agnss_ncellmeas_done(struct lte_lc_cells_info *cell_data, void *ctx)
+{
+	ARG_UNUSED(ctx);
+	agnss_net_info = cell_data;
+	k_sem_give(&agnss_ncellmeas_sem);
+}
+#endif /* CONFIG_SM_NRF_CLOUD_LOCATION */
+
+static void agnss_requestor(struct k_work *)
+{
+	int err;
+	struct nrf_modem_gnss_agnss_data_frame req;
+	struct nrf_cloud_coap_agnss_request request = {
+		.type = NRF_CLOUD_COAP_AGNSS_REQ_CUSTOM,
+		.agnss_req = &req,
+		.net_info = NULL,
+		.filtered = false,
+		.mask_angle = 0,
+	};
+	char *agnss_rest_data_buf = calloc(1, NRF_CLOUD_AGNSS_MAX_DATA_SIZE);
+
+	if (!agnss_rest_data_buf) {
+		LOG_ERR("Failed to allocate %s", "A-GNSS data buffer");
+		return;
+	}
+
+	err = read_agnss_req(&req);
+	if (err) {
+		LOG_ERR("Failed to read A-GNSS request: %d", err);
+		goto cleanup;
+	}
+
+	struct nrf_cloud_coap_agnss_result result = {
+		.buf = agnss_rest_data_buf,
+		.buf_sz = NRF_CLOUD_AGNSS_MAX_DATA_SIZE,
+		.agnss_sz = 0,
+	};
+
+#if defined(CONFIG_SM_NRF_CLOUD_LOCATION)
+	/* Start async ncellmeas and wait for the result via semaphore.
+	 * agnss_ncellmeas_done() is called from the AT monitor thread
+	 * (not sm_work_q) for the single-phase case, so giving the semaphore
+	 * does not deadlock this work item.
+	 */
+	struct lte_lc_cells_info *net_info = NULL;
+
+	err = sm_at_nrfcloud_ncellmeas_start(1, false, agnss_ncellmeas_done, NULL);
+	if (err == 0) {
+		/* We will wait for 5 seconds for NCELLMEAS to complete. */
+		k_sem_take(&agnss_ncellmeas_sem, K_SECONDS(5));
+		net_info = agnss_net_info;
+		agnss_net_info = NULL;
+	}
+
+	if (net_info != NULL && net_info->current_cell.id != LTE_LC_CELL_EUTRAN_ID_INVALID) {
+		request.net_info = net_info;
+	} else {
+		LOG_WRN("A-GNSS without location assistance");
+		sm_at_nrfcloud_ncellmeas_cleanup(net_info);
+		net_info = NULL;
+	}
+#else
+	LOG_INF("A-GNSS without location assistance, CONFIG_SM_NRF_CLOUD_LOCATION disabled");
+#endif
+	err = nrf_cloud_coap_agnss_data_get(&request, &result);
+#if defined(CONFIG_SM_NRF_CLOUD_LOCATION)
+	sm_at_nrfcloud_ncellmeas_cleanup(net_info);
+	net_info = NULL;
+#endif
+	if (err) {
+		LOG_ERR("Failed to request A-GNSS data via CoAP: %d", err);
+		goto cleanup;
+	}
+
+	err = nrf_cloud_agnss_process(result.buf, result.agnss_sz);
+	if (err) {
+		LOG_ERR("Failed to process A-GNSS data: %d", err);
+		goto cleanup;
+	}
+	LOG_INF("A-GNSS data received via CoAP");
+
+cleanup:
+	free(agnss_rest_data_buf);
+}
+#endif /* CONFIG_NRF_CLOUD_AGNSS */
+
+#if defined(CONFIG_NRF_CLOUD_PGPS)
+static void pgps_requestor(struct k_work *)
+{
+	int err;
+
+	/* Indirect request of P-GPS data and periodic injection */
+	err = nrf_cloud_pgps_notify_prediction();
+	if (err) {
+		LOG_ERR("Failed to request P-GPS prediction notification: %d", err);
+	} else {
+		LOG_INF("P-GPS prediction notification requested");
+	}
+}
+
+static void pgps_coap_requestor(struct k_work *)
+{
+	int err;
+	struct nrf_cloud_coap_pgps_request request = {.pgps_req = &pgps_coap_request};
+	struct nrf_cloud_pgps_result file_location = {0};
+	static char host[64];
+	static char path[128];
+
+	memset(host, 0, sizeof(host));
+	memset(path, 0, sizeof(path));
+
+	file_location.host = host;
+	file_location.host_sz = sizeof(host);
+	file_location.path = path;
+	file_location.path_sz = sizeof(path);
+
+	err = nrf_cloud_coap_pgps_url_get(&request, &file_location);
+	if (err) {
+		LOG_ERR("Failed to get P-GPS data: %d", err);
+		nrf_cloud_pgps_request_reset();
+		return;
+	}
+
+	err = nrf_cloud_pgps_update(&file_location);
+	if (err) {
+		LOG_ERR("Failed to process P-GPS response: %d", err);
+		nrf_cloud_pgps_request_reset();
+		return;
+	}
+
+	err = nrf_cloud_pgps_notify_prediction();
+	if (err) {
+		LOG_ERR("Failed to request current prediction: %d", err);
+		return;
+	}
+
+	LOG_INF("P-GPS predictions requested");
+}
+
+static void pgps_event_handler(struct nrf_cloud_pgps_event *event)
+{
+	int err;
+
+	switch (event->type) {
+	/* P-GPS initialization beginning. */
+	case PGPS_EVT_INIT:
+		LOG_INF("PGPS_EVT_INIT");
+		break;
+	/* There are currently no P-GPS predictions available. */
+	case PGPS_EVT_UNAVAILABLE:
+		LOG_INF("PGPS_EVT_UNAVAILABLE");
+		break;
+	/* P-GPS predictions are being loaded from the cloud. */
+	case PGPS_EVT_LOADING:
+		LOG_INF("PGPS_EVT_LOADING");
+		break;
+	/* A P-GPS prediction is available now for the current date and time. */
+	case PGPS_EVT_AVAILABLE: {
+		struct nrf_modem_gnss_agnss_data_frame req;
+
+		LOG_INF("PGPS_EVT_AVAILABLE");
+		/* read out previous NRF_MODEM_GNSS_EVT_AGNSS_REQ */
+		err = read_agnss_req(&req);
+		if (err) {
+			LOG_WRN("A-GNSS request read failed, using ephemerides only: %d", err);
+		}
+		err = nrf_cloud_pgps_inject(event->prediction, err ? NULL : &req);
+		if (err) {
+			LOG_ERR("Failed to inject P-GPS data to modem: %d", err);
+			break;
+		}
+		if (gnss_cloud_assistance) {
+			err = nrf_cloud_pgps_preemptive_updates();
+			if (err) {
+				/* This is expected to fail if new predictions are to be downloaded
+				 * but the connection to nRF Cloud is not available.
+				 * CONFIG_NRF_CLOUD_PGPS_REPLACEMENT_THRESHOLD controls
+				 * how often an attempt to download new predictions will be made.
+				 */
+				LOG_WRN("Failed to request new P-GPS predictions: %d", err);
+			}
+		}
+	} break;
+	/* All P-GPS predictions are available. */
+	case PGPS_EVT_READY:
+		LOG_INF("PGPS_EVT_READY");
+		break;
+	case PGPS_EVT_REQUEST:
+		LOG_INF("PGPS_EVT_REQUEST");
+		memcpy(&pgps_coap_request, event->request, sizeof(pgps_coap_request));
+		k_work_submit_to_queue(&sm_work_q, &pgps_coap_req_work);
+		break;
+	}
+}
+#endif /* CONFIG_NRF_CLOUD_PGPS */
+
+#endif /* CONFIG_SM_NRF_CLOUD */
+
+#if defined(CONFIG_SM_LOG_LEVEL_DBG)
+static void on_gnss_evt_nmea(void)
+{
+	int err;
+	size_t len;
+	char *nmea_str;
+	struct nrf_modem_gnss_nmea_data_frame nmea;
+
+	err = nrf_modem_gnss_read(&nmea, sizeof(nmea), NRF_MODEM_GNSS_DATA_NMEA);
+	if (err) {
+		LOG_ERR("Failed to read GNSS NMEA data: %d", err);
+	}
+	nmea_str = nmea.nmea_str;
+	len = strlen(nmea_str);
+
+	assert(len >= 2);
+	len -= 2;
+	assert(!strcmp(nmea_str + len, "\r\n"));
+	LOG_DBG("%.*s", len, nmea_str);
+}
+
+static void on_gnss_evt_pvt(void)
+{
+	struct nrf_modem_gnss_pvt_data_frame pvt;
+	int err;
+
+	err = nrf_modem_gnss_read((void *)&pvt, sizeof(pvt), NRF_MODEM_GNSS_DATA_PVT);
+	if (err) {
+		LOG_ERR("Failed to read GNSS PVT data: %d", err);
+		return;
+	}
+	for (int i = 0; i < NRF_MODEM_GNSS_MAX_SATELLITES; ++i) {
+		if (pvt.sv[i].sv) { /* SV number 0 indicates no satellite */
+			LOG_DBG("SV:%3d sig:%d c/n0:%4d el:%3d az:%3d in-fix:%d unhealthy:%d",
+				pvt.sv[i].sv, pvt.sv[i].signal, pvt.sv[i].cn0,
+				pvt.sv[i].elevation, pvt.sv[i].azimuth,
+				(pvt.sv[i].flags & NRF_MODEM_GNSS_SV_FLAG_USED_IN_FIX) ? 1 : 0,
+				(pvt.sv[i].flags & NRF_MODEM_GNSS_SV_FLAG_UNHEALTHY) ? 1 : 0);
+		}
+	}
+}
+#endif /* CONFIG_SM_LOG_LEVEL_DBG */
+
+#if defined(CONFIG_SM_NRF_CLOUD)
+static int do_cloud_send_obj(struct nrf_cloud_obj *const obj)
+{
+	int err;
+
+	err = nrf_cloud_coap_obj_send(obj, true);
+	if (err) {
+		LOG_ERR("nRF Cloud send failed: %d", err);
+	}
+
+	(void)nrf_cloud_obj_free(obj);
+
+	return err;
+}
+
+static void send_location(struct nrf_modem_gnss_pvt_data_frame * const pvt_data)
+{
+#define CLOUD_GNSS_HEADING_ACC_LIMIT (float)60.0
+
+	static int64_t last_ts_ms = NRF_CLOUD_NO_TIMESTAMP;
+	int err;
+
+	/* Map modem PVT data to nRF Cloud PVT structure */
+	struct nrf_cloud_gnss_pvt pvt = {
+		.lat        = pvt_data->latitude,
+		.lon        = pvt_data->longitude,
+		.accuracy   = pvt_data->accuracy,
+		.alt        = pvt_data->altitude,
+		.has_alt    = 1,
+		.speed      = pvt_data->speed,
+		.has_speed  = pvt_data->flags & NRF_MODEM_GNSS_PVT_FLAG_VELOCITY_VALID,
+		.heading    = pvt_data->heading,
+		.has_heading = pvt_data->heading_accuracy < CLOUD_GNSS_HEADING_ACC_LIMIT ? 1 : 0,
+	};
+
+	struct nrf_cloud_gnss_data gnss = {
+		.ts_ms = NRF_CLOUD_NO_TIMESTAMP,
+		.type = NRF_CLOUD_GNSS_TYPE_PVT,
+		.pvt = pvt,
+	};
+
+	NRF_CLOUD_OBJ_COAP_CBOR_DEFINE(msg_obj);
+	/* On failure, NRF_CLOUD_NO_TIMESTAMP is used and the timestamp is omitted */
+	(void)date_time_now(&gnss.ts_ms);
+
+	if ((last_ts_ms == NRF_CLOUD_NO_TIMESTAMP) ||
+	    (gnss.ts_ms == NRF_CLOUD_NO_TIMESTAMP) ||
+	    (gnss.ts_ms > (last_ts_ms + LOCATION_REPORT_MS))) {
+		last_ts_ms = gnss.ts_ms;
+	} else {
+		return;
+	}
+
+	/* Encode the location data into a device message */
+	err = nrf_cloud_obj_gnss_msg_create(&msg_obj, &gnss);
+	if (!err) {
+		err = do_cloud_send_obj(&msg_obj);
+	}
+
+	if (err) {
+		LOG_WRN("Failed to send location: %d", err);
+	}
+}
+#endif /* CONFIG_SM_NRF_CLOUD */
+
+static void gnss_fix_sender(struct k_work *)
+{
+	int err;
+	struct nrf_modem_gnss_pvt_data_frame pvt;
+
+	err = nrf_modem_gnss_read((void *)&pvt, sizeof(pvt), NRF_MODEM_GNSS_DATA_PVT);
+	if (err) {
+		LOG_ERR("Failed to read GNSS PVT data: %d", err);
+		return;
+	}
+
+	/* GIS accuracy: http://wiki.gis.com/wiki/index.php/Decimal_degrees, use default .6lf */
+	urc_send_to(gnss_pipe,
+		    "\r\n#XGNSSPOS: %lf,%lf,%f,%f,%f,%f,\"%04u-%02u-%02u %02u:%02u:%02u\"\r\n",
+		    pvt.latitude, pvt.longitude, (double)pvt.altitude, (double)pvt.accuracy,
+		    (double)pvt.speed, (double)pvt.heading, pvt.datetime.year, pvt.datetime.month,
+		    pvt.datetime.day, pvt.datetime.hour, pvt.datetime.minute, pvt.datetime.seconds);
+
+	for (int i = 0; i < NRF_MODEM_GNSS_MAX_SATELLITES; ++i) {
+		if (pvt.sv[i].sv) { /* SV number 0 indicates no satellite */
+			LOG_INF("SV:%3d sig:%d c/n0:%4d el:%3d az:%3d in-fix:%d unhealthy:%d",
+				pvt.sv[i].sv, pvt.sv[i].signal, pvt.sv[i].cn0,
+				pvt.sv[i].elevation, pvt.sv[i].azimuth,
+				(pvt.sv[i].flags & NRF_MODEM_GNSS_SV_FLAG_USED_IN_FIX) ? 1 : 0,
+				(pvt.sv[i].flags & NRF_MODEM_GNSS_SV_FLAG_UNHEALTHY) ? 1 : 0);
+		}
+	}
+
+#if defined(CONFIG_SM_PGPS_INJECT_FIX_DATA) || defined(CONFIG_SM_CARRIER)
+	struct tm gps_time = {
+		.tm_year = pvt.datetime.year - 1900,
+		.tm_mon  = pvt.datetime.month - 1,
+		.tm_mday = pvt.datetime.day,
+		.tm_hour = pvt.datetime.hour,
+		.tm_min  = pvt.datetime.minute,
+		.tm_sec  = pvt.datetime.seconds,
+	};
+#endif
+
+#if defined(CONFIG_SM_NRF_CLOUD)
+
+	if (sm_nrf_cloud_send_location && sm_nrf_cloud_ready) {
+		/* Report to nRF Cloud by best-effort */
+		send_location(&pvt);
+	}
+
+#if defined(CONFIG_SM_PGPS_INJECT_FIX_DATA)
+	/* help date_time to save SNTP transactions */
+	date_time_set(&gps_time);
+	/* help nrf_cloud_pgps as most recent known location */
+	nrf_cloud_pgps_set_location(pvt.latitude, pvt.longitude);
+#endif
+
+#endif /* CONFIG_SM_NRF_CLOUD */
+
+#if defined(CONFIG_SM_CARRIER)
+	lwm2m_carrier_location_set(pvt.latitude,
+				   pvt.longitude,
+				   pvt.altitude,
+				   (uint32_t)mktime(&gps_time),
+				   pvt.accuracy);
+	lwm2m_carrier_velocity_set(pvt.heading,
+				   pvt.speed,
+				   pvt.vertical_speed,
+				   pvt.speed_accuracy,
+				   pvt.vertical_speed_accuracy);
+#endif /* CONFIG_SM_CARRIER */
+}
+
+static void on_gnss_evt_fix(void)
+{
+	if (gnss_ttff_start != 0) {
+		const int64_t delta = k_uptime_delta(&gnss_ttff_start);
+
+		LOG_INF("TTFF %d.%ds", (int)(delta/1000), (int)(delta%1000));
+		gnss_ttff_start = 0;
+	}
+
+	k_work_submit_to_queue(&sm_work_q, &gnss_fix_send_work);
+}
+
+/* NOTE this event handler runs in interrupt context */
+static void gnss_event_handler(int event)
+{
+	switch (event) {
+#if defined(CONFIG_SM_LOG_LEVEL_DBG)
+	case NRF_MODEM_GNSS_EVT_PVT:
+		on_gnss_evt_pvt();
+		break;
+	case NRF_MODEM_GNSS_EVT_NMEA:
+		on_gnss_evt_nmea();
+		break;
+#endif
+	case NRF_MODEM_GNSS_EVT_FIX:
+		LOG_INF("GNSS_EVT_FIX");
+		on_gnss_evt_fix();
+		break;
+	case NRF_MODEM_GNSS_EVT_AGNSS_REQ:
+		LOG_INF("GNSS_EVT_AGNSS_REQ");
+		on_gnss_evt_agnss_req();
+		break;
+	case NRF_MODEM_GNSS_EVT_BLOCKED:
+		LOG_INF("GNSS_EVT_BLOCKED");
+		break;
+	case NRF_MODEM_GNSS_EVT_UNBLOCKED:
+		LOG_INF("GNSS_EVT_UNBLOCKED");
+		break;
+	case NRF_MODEM_GNSS_EVT_PERIODIC_WAKEUP:
+		LOG_DBG("GNSS_EVT_PERIODIC_WAKEUP");
+		gnss_status_set(GNSS_STATUS_PERIODIC_WAKEUP);
+		break;
+	case NRF_MODEM_GNSS_EVT_SLEEP_AFTER_TIMEOUT:
+		LOG_INF("GNSS_EVT_SLEEP_AFTER_TIMEOUT");
+		gnss_status_set(GNSS_STATUS_SLEEP_AFTER_TIMEOUT);
+		break;
+	case NRF_MODEM_GNSS_EVT_SLEEP_AFTER_FIX:
+		LOG_DBG("GNSS_EVT_SLEEP_AFTER_FIX");
+		gnss_status_set(GNSS_STATUS_SLEEP_AFTER_FIX);
+		break;
+	case NRF_MODEM_GNSS_EVT_REF_ALT_EXPIRED:
+		LOG_INF("GNSS_EVT_REF_ALT_EXPIRED");
+		break;
+	default:
+		break;
+	}
+}
+
+SM_AT_CMD_CUSTOM(xgnss, "AT#XGNSS", handle_at_gnss);
+static int handle_at_gnss(enum at_parser_cmd_type cmd_type, struct at_parser *parser,
+			 uint32_t param_count)
+{
+	int err = 0;
+	uint16_t op;
+	uint16_t interval;
+	uint16_t timeout;
+
+	enum {
+		OP_IDX = 1,
+		CLOUD_ASSISTANCE_IDX,
+		INTERVAL_IDX,
+		TIMEOUT_IDX,
+		MAX_PARAM_COUNT
+	};
+	switch (cmd_type) {
+	case AT_PARSER_CMD_TYPE_SET:
+		err = at_parser_num_get(parser, OP_IDX, &op);
+		if (err) {
+			return err;
+		}
+		if (op == GNSS_START) {
+			if (gnss_running) {
+				LOG_ERR("GNSS already running");
+				return -EBUSY;
+			}
+
+			gnss_pipe = sm_at_host_get_current_pipe();
+
+			err = at_parser_num_get(
+				parser, CLOUD_ASSISTANCE_IDX, &gnss_cloud_assistance);
+			if (err || gnss_cloud_assistance > 1) {
+				return -EINVAL;
+			}
+			if (!IS_ENABLED(CONFIG_NRF_CLOUD_AGNSS) &&
+			    !IS_ENABLED(CONFIG_NRF_CLOUD_PGPS)
+			&& gnss_cloud_assistance) {
+				LOG_ERR("A-GNSS/P-GPS not compiled in");
+				return -ENOTSUP;
+			}
+
+			if (gnss_cloud_assistance
+#if defined(CONFIG_SM_NRF_CLOUD)
+			&& !sm_nrf_cloud_ready
+#endif
+			) {
+				LOG_ERR(
+					"nRF Cloud connection required for A-GNSS/P-GPS");
+				return -ENOTCONN;
+			}
+
+			err = at_parser_num_get(parser, INTERVAL_IDX, &interval);
+			if (err || (interval > 1 && interval < 10)) {
+				return -EINVAL;
+			}
+			err = nrf_modem_gnss_fix_interval_set(interval);
+			if (err) {
+				LOG_ERR("Failed to set GNSS fix %s: %d", "interval", err);
+				return err;
+			}
+
+			/* Disable scheduled downloads for periodical tracking */
+			if (interval >= 10) {
+				err = nrf_modem_gnss_use_case_set(
+						NRF_MODEM_GNSS_USE_CASE_MULTIPLE_HOT_START |
+						NRF_MODEM_GNSS_USE_CASE_SCHED_DOWNLOAD_DISABLE);
+			} else {
+				err = nrf_modem_gnss_use_case_set(
+						NRF_MODEM_GNSS_USE_CASE_MULTIPLE_HOT_START);
+			}
+			if (err) {
+				LOG_ERR("Failed to set use case: %d", err);
+				return err;
+			}
+
+			if (interval == 1) {
+				/* Continuous navigation mode; the timeout must not be given. */
+				if (param_count != TIMEOUT_IDX) {
+					return -EINVAL;
+				}
+			} else {
+				if (param_count == TIMEOUT_IDX) {
+					timeout = 60;  /* default value */
+				} else {
+					err = at_parser_num_get(
+						parser, TIMEOUT_IDX, &timeout);
+					if (err || param_count != MAX_PARAM_COUNT) {
+						return -EINVAL;
+					}
+				}
+				/* Make sure to configure the timeout unconditionally in single-fix
+				 * and periodic navigation modes.
+				 * An old value might otherwise remain from a previous GNSS run.
+				 */
+				err = nrf_modem_gnss_fix_retry_set(timeout);
+				if (err) {
+					LOG_ERR("Failed to set GNSS fix %s: %d", "retry", err);
+					return err;
+				}
+			}
+
+			err = gnss_startup();
+		} else if (op == GNSS_STOP && param_count == 2) {
+			if (gnss_running) {
+				err = gnss_shutdown();
+			} else {
+				err = 0;
+			}
+		} else {
+			err = -EINVAL;
+		}
+		break;
+
+	case AT_PARSER_CMD_TYPE_READ:
+		rsp_send("\r\n#XGNSS: %d,%d\r\n", (int)is_gnss_activated(), gnss_status);
+		break;
+
+	case AT_PARSER_CMD_TYPE_TEST:
+		rsp_send("\r\n#XGNSS: (%d,%d),(0,1),<interval>,<timeout>\r\n",
+			GNSS_STOP, GNSS_START);
+		break;
+
+	default:
+		err = -EINVAL;
+		break;
+	}
+
+	return err;
+}
+
+SM_AT_CMD_CUSTOM(xgnssdel, "AT#XGNSSDEL", handle_at_gnss_delete);
+static int handle_at_gnss_delete(enum at_parser_cmd_type cmd_type, struct at_parser *parser,
+				uint32_t)
+{
+	int err = -EINVAL;
+	uint32_t mask;
+
+	switch (cmd_type) {
+	case AT_PARSER_CMD_TYPE_SET:
+		err = at_parser_num_get(parser, 1, &mask);
+		if (err || !mask || (mask & NRF_MODEM_GNSS_DELETE_TCXO_OFFSET)) {
+			return -EINVAL;
+		}
+		err = nrf_modem_gnss_nv_data_delete(mask);
+		break;
+
+	case AT_PARSER_CMD_TYPE_TEST:
+		rsp_send("\r\n#XGNSSDEL: <mask>\r\n");
+		err = 0;
+		break;
+
+	default:
+		break;
+	}
+
+	return err;
+}
+
+static void sm_at_gnss_cb_init(int ret, void *ctx)
+{
+	int err = nrf_modem_gnss_event_handler_set(gnss_event_handler);
+
+	if (err) {
+		LOG_ERR("Failed to set GNSS event handler: %d", err);
+		sm_init_failed = true;
+	}
+}
+NRF_MODEM_LIB_ON_INIT(sm_gnss_init_hook, sm_at_gnss_cb_init, NULL);
+
+/**@brief API to initialize GNSS AT commands handler
+ */
+static int sm_at_gnss_init(void)
+{
+	k_work_init(&gnss_status_notify_work, gnss_status_notifier);
+
+#if defined(CONFIG_SM_NRF_CLOUD)
+#if defined(CONFIG_NRF_CLOUD_AGNSS)
+	k_work_init(&agnss_req_work, agnss_requestor);
+#endif
+#if defined(CONFIG_NRF_CLOUD_PGPS)
+	k_work_init(&pgps_req_work, pgps_requestor);
+	k_work_init(&pgps_coap_req_work, pgps_coap_requestor);
+#endif /* CONFIG_NRF_CLOUD_PGPS */
+#endif /* CONFIG_SM_NRF_CLOUD */
+	k_work_init(&gnss_fix_send_work, gnss_fix_sender);
+
+	return 0;
+}
+SYS_INIT(sm_at_gnss_init, APPLICATION, 0);

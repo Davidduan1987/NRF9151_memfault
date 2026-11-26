@@ -1,0 +1,43 @@
+.. _sm_extending:
+
+Extending the application
+#########################
+
+.. contents::
+   :local:
+   :depth: 2
+
+The AT commands in the |SM| are implemented with the `Custom AT commands`_ library.
+You can extend the |SM| application by adding your own AT commands.
+
+Adding AT commands
+******************
+
+If you want to implement a custom AT command in |SM|, you will need to follow the instructions in the `Custom AT commands`_ library documentation.
+Setting the AT command filter and callback with the ``AT_CMD_CUSTOM`` macro is enough for a custom AT command that does not require setup or teardown.
+
+As a preferred alternative to the ``AT_CMD_CUSTOM`` macro, |SM| defines the ``SM_AT_CMD_CUSTOM`` macro, which is a wrapper around the ``AT_CMD_CUSTOM`` macro.
+The ``SM_AT_CMD_CUSTOM`` macro pre-processes the AT command parameters for the AT command callback and sets the default ``OK`` response if the callback returns successfully.
+
+If your custom AT command requires setup or teardown, you will need to perform the following steps:
+
+1. Create a header file in :file:`app/src/`.
+   The file must expose the following function declarations:
+
+   * ``*_init()`` - Your setup function for the custom AT command.
+   * ``*_uninit()`` - Your teardown function for the custom AT command.
+
+#. Create a corresponding :file:`.c` file in :file:`app/src/`.
+   The file must implement the following functions:
+
+   * Your AT command callback, which is declared with the ``AT_CMD_CUSTOM`` macro.
+   * ``*_init()`` - Your setup function for the custom AT command.
+   * ``*_uninit()`` - Your teardown function for the custom AT command.
+     Make sure that the teardown function exits successfully.
+     It will be called before entering power saving states or shutting down.
+
+#. Edit :file:`app/src/sm_at_commands.c` and make the following changes:
+
+   a. Include your header file.
+   #. In the ``sm_at_init()`` function, add a call to your setup function.
+   #. In the ``sm_at_uninit()`` function, add a call to your teardown function.

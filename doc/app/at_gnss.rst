@@ -1,0 +1,433 @@
+.. _SM_AT_GNSS:
+
+GNSS AT commands
+****************
+
+.. contents::
+   :local:
+   :depth: 1
+
+This page describes GNSS-related AT commands.
+
+Control GNSS #XGNSS
+===================
+
+The ``#XGNSS`` command controls the GNSS.
+
+Set command
+-----------
+
+The set command allows you to start and stop the GNSS module.
+
+The `nRF Cloud A-GNSS`_ service can be used with the module to reduce the time it takes for the GNSS module to estimate device position.
+
+.. only:: not nrf91m1
+
+   Both the `nRF Cloud A-GNSS`_ service and the `nRF Cloud P-GPS`_ service can be used with the module, either together or independently of each other.
+   Using them reduces the time it takes for the GNSS module to estimate device position.
+
+   To use either of them, the device must be connected to nRF Cloud (using the :ref:`#XNRFCLOUD <SM_AT_NRFCLOUD>` AT command) when starting the GNSS module.
+   In addition, the following Kconfig options must be enabled:
+
+   * ``CONFIG_NRF_CLOUD_AGNSS`` to use A-GNSS.
+   * ``CONFIG_NRF_CLOUD_PGPS`` to use P-GPS.
+     This also requires applying the :file:`pgps-nrf9151.overlay` devicetree overlay to both the application and the ``mcuboot`` image (using the absolute path for the latter).
+
+   If both assistive services were enabled during compilation, you cannot choose to use only one of them at run time.
+
+Syntax
+~~~~~~
+
+::
+
+   AT#XGNSS=<op>,<cloud_assistance>,<interval>[,<timeout>]
+
+The parameters and their defined values are the following:
+
+<op>
+   * ``0`` - Stop the GNSS module.
+     In this case, no other parameter is allowed.
+   * ``1`` - Start the GNSS module.
+
+<cloud_assistance>
+   * ``0`` - Disabled.
+   * ``1`` - Enabled.
+
+<interval>
+   Integer.
+   The GNSS fix interval in seconds.
+   It can have one of the following values:
+
+   * ``0`` - Single-fix navigation mode.
+   * ``1`` - Continuous navigation mode.
+     The fix interval is set to 1 second.
+   * Ranging from ``10`` to ``65535`` - Periodic navigation mode.
+     The fix interval is set to the specified value.
+
+<timeout>
+   Integer.
+   The maximum time in seconds that the GNSS receiver is allowed to run while trying to produce a valid Position, Velocity, and Time (PVT) estimate.
+   Can only be specified in single-fix and periodic navigation modes, and must be omitted in continuous navigation mode.
+   If omitted in single-fix or periodic navigation modes, the default value is 60 seconds.
+
+   * ``0`` - The GNSS receiver runs indefinitely until a valid PVT estimate is produced.
+   * Any positive integer - The GNSS receiver is turned off after the specified time is up, even if a valid PVT estimate was not produced.
+
+In periodic navigation mode, the ``<interval>`` and ``<timeout>`` parameters are temporarily ignored during the first fix.
+
+.. note::
+
+   When ``<cloud_assistance>`` is disabled, no request is made to nRF Cloud for assistance data.
+   However, if it has been previously enabled and used, such data may remain locally available and will be used if still valid.
+
+.. note::
+
+   Make sure that the GNSS antenna is configured properly.
+   You may need to issue the ``AT%XMAGPIO`` and ``AT%XCOEX0`` AT commands to configure the Low-Noise Amplifier (LNA), depending on the hardware (HW).
+
+   If you want to use the nRF9151 DK with an onboard antenna, use the ``AT%XCOEX0=1,1,1565,1586`` command.
+
+.. tip::
+
+   When the LTE link is enabled, make sure to have either Power Saving Mode (PSM) or extended Discontinuous Reception (eDRX) enabled to give the GNSS receiver the time it needs to acquire fixes.
+
+.. only:: not nrf91m1
+
+   .. tip::
+
+      The |SM| application logs NMEA and PVT data when trying to acquire fixes, which can help with troubleshooting.
+      These logs are enabled if the ``CONFIG_SM_LOG_LEVEL_DBG`` Kconfig option is set and logs have been enabled with ``AT#XLOG``.
+
+   .. note::
+
+      See the documentation for the `nRF Cloud A-GNSS`_ and `nRF Cloud P-GPS`_ libraries for information on how to best configure and use A-GNSS and P-GPS, respectively.
+
+   .. note::
+
+      When using P-GPS, make sure that the value of the :ref:`CONFIG_SM_PGPS_INJECT_FIX_DATA <CONFIG_SM_PGPS_INJECT_FIX_DATA>` Kconfig option matches your use case.
+      It is enabled by default but should be disabled if the device is expected to move distances longer than a few dozen kilometers between fix attempts.
+
+   .. note::
+
+      When using P-GPS, apply the :file:`pgps-nrf9151.overlay` devicetree overlay to both the application and the ``mcuboot`` image to provide a dedicated flash partition for P-GPS prediction data storage and to ensure MCUboot operates with the same partition layout.
+      The absolute path to the overlay file must be provided when passing it to the ``mcuboot`` image using :makevar:`mcuboot_EXTRA_DTC_OVERLAY_FILE`.
+      See :ref:`sm_config_files` for more information.
+
+As an alternative to GNSS-based positioning, see :ref:`#XNRFCLOUDPOS <SM_AT_NRFCLOUDPOS>` for cellular and Wi-Fi® positioning.
+
+Unsolicited notification
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+``#XGNSSPOS`` notification indicates that a new position fix has been acquired.
+
+.. code-block::
+
+   #XGNSSPOS: <latitude>,<longitude>,<altitude>,<accuracy>,<speed>,<heading>,<datetime>
+
+The parameters and their defined values are the following:
+
+<latitude>
+   Float.
+   The latitude in degrees.
+
+<longitude>
+   Float.
+   The longitude in degrees.
+
+<altitude>
+   Float.
+   The altitude above the WGS-84 ellipsoid in meters.
+
+<accuracy>
+   Float.
+   The accuracy (2D 1-sigma) in meters.
+
+<speed>
+   Float.
+   The horizontal speed in meters per second.
+
+<heading>
+   Float.
+   The heading of the movement of the user in degrees.
+
+<datetime>
+   String.
+   The UTC date-time.
+
+``#XGNSS`` notification indicates GNSS status.
+
+.. sm_gps_status_notif_start
+
+.. code-block::
+
+   #XGNSS: <gnss_service>,<gnss_status>
+
+The parameters and their defined values are the following:
+
+<gnss_service>
+   Integer.
+   When it has the value ``1``, it means that GNSS is supported in ``%XSYSTEMMODE`` and activated in ``+CFUN``.
+
+<gnss_status>
+   * ``0`` - GNSS is stopped.
+   * ``1`` - GNSS is started.
+   * ``2`` - GNSS wakes up in periodic mode.
+   * ``3`` - GNSS enters sleep because of timeout.
+   * ``4`` - GNSS enters sleep because a fix is acquired.
+
+.. sm_gps_status_notif_end
+
+Example
+~~~~~~~
+
+Get GNSS fix in GNSS only mode:
+
+::
+
+  AT%XSYSTEMMODE=0,0,1,0
+
+  OK
+  AT+CFUN=31
+
+  OK
+  AT#XGNSS=1,0,0,0
+
+  #XGNSS: 1,1
+
+  OK
+
+  #XGNSSPOS: 35.457576,139.625090,121.473785,22.199919,0.442868,0.000000,"2021-06-02 06:25:48"
+
+  #XGNSS: 1,4
+
+Set PSM and eDRX configurations, use GNSS assistance from nRF Cloud and get GNSS fixes in continuous navigation mode:
+
+::
+
+  AT%XSYSTEMMODE=1,0,1,0
+
+  OK
+  AT+CPSMS=1,,,"00000001","00000011"
+
+  OK
+  AT+CEDRXS=2,4,"0011"
+
+  OK
+  AT+CFUN=1
+
+  OK
+
+  +CEDRXP: 4,"0011","0011","0011"
+
+  AT#XNRFCLOUD=1
+
+  OK
+  #XNRFCLOUD: 1,0
+  AT#XGNSS=1,1,1
+
+  #XGNSS: 1,1
+
+  OK
+
+  #XGNSSPOS: 35.457417,139.625211,162.850952,15.621976,1.418092,0.000000,"2021-06-02 05:21:31"
+
+  #XGNSSPOS: 35.457435,139.625348,176.104797,14.245458,1.598184,69.148659,"2021-06-02 05:21:32"
+
+  #XGNSSPOS: 35.457417,139.625415,179.132980,13.318132,1.235241,69.148659,"2021-06-02 05:21:33"
+
+  #XGNSSPOS: 35.457410,139.625469,181.223541,12.667312,0.803951,69.148659,"2021-06-02 05:21:34"
+  AT#XGNSS=0
+  OK
+
+  #XGNSS: 1,0
+
+Set PSM and eDRX configurations, use GNSS assistance from nRF Cloud and get GNSS fixes in periodic navigation mode every 10 seconds:
+
+::
+
+  AT%XSYSTEMMODE=1,0,1,0
+
+  OK
+  AT+CPSMS=1,,,"00000001","00000011"
+
+  OK
+  AT+CEDRXS=2,4,"0011"
+
+  OK
+  AT+CFUN=1
+
+  OK
+  AT#XNRFCLOUD=1
+
+  OK
+  #XNRFCLOUD: 1,0
+  AT#XGNSS=1,1,10
+
+  #XGNSS: 1,1
+
+  OK
+
+  #XGNSS: 1,2
+
+  #XGNSSPOS: 35.457243,139.625435,149.005020,28.184258,10.431827,281.446014,"2021-06-24 04:35:52"
+
+  #XGNSS: 1,4
+
+  #XGNSS: 1,2
+
+  #XGNSSPOS: 35.457189,139.625602,176.811203,43.015198,0.601837,281.446014,"2021-06-24 04:36:32"
+
+  #XGNSS: 1,4
+
+  #XGNSS: 1,2
+
+  #XGNSSPOS: 35.457498,139.625422,168.243591,31.753956,0.191195,281.446014,"2021-06-24 04:37:12"
+
+  #XGNSS: 1,4
+
+  #XGNSS: 1,2
+
+  #XGNSSPOS: 35.457524,139.624667,100.745979,25.324850,6.347160,94.699837,"2021-06-24 04:37:52"
+
+  #XGNSS: 1,4
+  AT#XGNSS=0
+
+  #XGNSS: 1,0
+
+  OK
+
+Read command
+------------
+
+The read command allows you to check GNSS support and its status.
+
+Syntax
+~~~~~~
+
+::
+
+   AT#XGNSS?
+
+Response syntax
+~~~~~~~~~~~~~~~
+
+.. include:: at_gnss.rst
+   :start-after: sm_gps_status_notif_start
+   :end-before: sm_gps_status_notif_end
+
+Example
+~~~~~~~
+
+::
+
+  AT#XGNSS?
+
+  #XGNSS: 1,1
+
+  OK
+
+Test command
+------------
+
+The test command tests the existence of the command and provides information about the type of its subparameters.
+
+Syntax
+~~~~~~
+
+::
+
+   AT#XGNSS=?
+
+Example
+~~~~~~~
+
+::
+
+  AT#XGNSS=?
+
+  #XGNSS: (0,1),(0,1),<interval>,<timeout>
+
+  OK
+
+Delete GNSS data #XGNSSDEL
+==========================
+
+The ``#XGNSSDEL`` command deletes GNSS data from non-volatile memory.
+This command should be issued when GNSS is activated but not started yet.
+
+.. note::
+   This is a debug feature, and is not supposed to be used in production code.
+
+Set command
+-----------
+
+The set command allows you to delete cached GNSS data.
+Using this command does not trigger A-GNSS nor P-GPS data request events.
+The execution of this command may delay the full functionality of A-GNSS and P-GPS until the next periodic data request has been received.
+
+Syntax
+~~~~~~
+
+::
+
+   AT#XGNSSDEL=<mask>
+
+The parameters and their defined values are the following:
+
+<mask>
+   Integer.
+   A bitwise ``OR`` of the following bitmasks:
+
+   * ``0x001`` - Ephemerides.
+   * ``0x002`` - Almanacs (excluding leap second and ionospheric correction).
+   * ``0x004`` - Ionospheric correction parameters.
+   * ``0x008`` - Last good fix (the last position).
+   * ``0x010`` - GPS time-of-week (TOW).
+   * ``0x020`` - GPS week number.
+   * ``0x040`` - Leap second (UTC parameters).
+   * ``0x100`` - Precision estimate of GPS time-of-week (TOW).
+   * ``0x400`` - Extended Kalman Filter (EKF) state (last position/velocity/time solution).
+
+For example, the integer value with all of the above bits enabled will be ``1407`` (``0x57f``).
+
+Example
+~~~~~~~
+
+::
+
+  AT%XSYSTEMMODE=0,0,1,0
+  OK
+  AT+CFUN=31
+  OK
+  AT#XGNSSDEL=1407
+  OK
+  AT+CFUN=0
+  OK
+
+Read command
+------------
+
+The read command is not supported.
+
+Test command
+------------
+
+The test command tests the existence of the command and provides information about the type of its subparameters.
+
+Syntax
+~~~~~~
+
+::
+
+   AT#XGNSSDEL=?
+
+Example
+~~~~~~~
+
+::
+
+  AT#XGNSSDEL=?
+
+  #XGNSSDEL: <mask>
+
+  OK

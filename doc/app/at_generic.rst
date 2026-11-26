@@ -1,0 +1,887 @@
+.. _SM_AT_gen:
+
+Generic AT commands
+*******************
+
+.. contents::
+   :local:
+   :depth: 1
+
+This page describes generic AT commands.
+
+UART baud rate AT+IPR
+=====================
+
+The ``AT+IPR`` command sets the UART baud rate.
+
+Set command
+-----------
+
+The set command sets the UART baud rate.
+|SM| does not support automatic baud rate detection.
+When the device resets, the baud rate is set to the default value set in the devicetree.
+
+Syntax
+~~~~~~
+
+::
+
+   AT+IPR=<baud_rate>
+
+The parameters and their defined values are the following:
+
+<baud_rate>
+   Integer.
+   The desired baud rate.
+
+.. note::
+
+   The baud rate change takes effect after the modem responds with ``OK``.
+   The host must switch to the new baud rate to continue communication.
+
+Example
+~~~~~~~
+
+Set the baud rate to 115200.
+
+::
+
+   AT+IPR=115200
+   OK
+
+Read command
+------------
+
+The read command reads the current UART baud rate.
+
+Syntax
+~~~~~~
+
+::
+
+   AT+IPR?
+
+Response syntax
+~~~~~~~~~~~~~~~
+
+::
+
+   +IPR: <baud_rate>
+
+Example
+~~~~~~~
+
+::
+
+   AT+IPR?
+   +IPR: 115200
+   OK
+
+Test command
+------------
+
+The test command lists the supported baud rates.
+
+Syntax
+~~~~~~
+
+::
+
+   AT+IPR=?
+
+Response syntax
+~~~~~~~~~~~~~~~
+
+::
+
+   +IPR: (list of supported autodetectable baud rates)[,(list of fixed-only baud rates)]
+
+Example
+~~~~~~~
+
+::
+
+   AT+IPR=?
+   +IPR: (),(115200,230400,460800,921600,1000000)
+   OK
+
+|SM| echo E0/E1
+===============
+
+The ``E`` command enables or disables the AT command echo feature of the |SM| application.
+
+Set command
+-----------
+
+The set command enables or disables the AT command echo feature.
+While enabled, the |SM| application echoes back all the characters that are received in the AT command mode.
+
+.. note::
+
+   When working with a terminal, you should disable local echo to avoid double echoing of characters.
+
+Syntax
+~~~~~~
+
+::
+
+   ATE1 - Enable AT command echo.
+   ATE0 - Disable AT command echo (default).
+
+Example
+~~~~~~~
+
+Set the AT command echo:
+
+::
+
+   ATE1
+   OK
+
+   AT
+   AT    // Echoed command
+   OK
+
+   ATE0
+   ATE0  // Echoed command
+   OK
+
+   AT
+   OK
+
+Read command
+------------
+
+The read command is not supported.
+
+Test command
+------------
+
+The test command is not supported.
+
+.. _SM_AT_XSMVER:
+
+|SM| version #XSMVER
+=====================
+
+The ``#XSMVER`` command return the versions of the |SM| and |NCS| in which the |SM| application is built.
+
+Set command
+-----------
+
+The set command returns the versions of the |SM| and |NCS|.
+
+Syntax
+~~~~~~
+
+::
+
+   AT#XSMVER
+
+Response syntax
+~~~~~~~~~~~~~~~
+
+::
+
+   #XSMVER: "<sm_version>","<ncs_version>"[,"<customer_version>"]
+
+The parameters and their defined values are the following:
+
+<sm_version>
+   String.
+   The version of the |SM| application in Git-describe style.
+   The ``major.minor.patch`` prefix comes from :file:`app/VERSION`.
+   The optional ``-N-g<hash>`` suffix (and ``-dirty``) comes from ``git describe`` in the application tree.
+
+   Example: ``"v1.99.0-68-gb2d3dde4dfa2"`` uses ``1.99.0`` from :file:`app/VERSION` and ``-68-gb2d3dde4dfa2`` from Git.
+
+   Hosts can use that ``major.minor.patch`` prefix to verify that application DFU moved to a newer image (compare ``AT#XSMVER`` before and after update).
+   MCUboot applies the same ordering using the sign version from :file:`app/VERSION` (``major.minor.patch+tweak``).
+   The Git suffix is not part of that check.
+   See :ref:`sm_releasing` for release version updates.
+
+<ncs_version>
+   String.
+   The version of the |NCS|.
+
+.. only:: not nrf91m1
+
+   <customer_version>
+      String.
+      The :ref:`CONFIG_SM_CUSTOMER_VERSION <CONFIG_SM_CUSTOMER_VERSION>` string, if defined.
+
+.. only:: nrf91m1
+
+   <customer_version>
+      String. This parameter is missing on official builds.
+
+Example
+~~~~~~~
+
+The following command example reads the versions:
+
+::
+
+   // First v2.0.0 pre-release
+   AT#XSMVER
+   #XSMVER: "v1.99.0","3.3.99"
+   OK
+
+   // Development build
+   AT#XSMVER
+   #XSMVER: "v1.99.0-67-ga9e396bc3d58","3.3.99"
+   OK
+
+   // Second v2.0.0 pre-release (VERSION 1.99.1)
+   AT#XSMVER
+   #XSMVER: "v1.99.1","3.3.99"
+   OK
+
+   // v2.0.0 release
+   AT#XSMVER
+   #XSMVER: "v2.0.0","3.4.0"
+   OK
+
+   // Pre-release with customer version
+   AT#XSMVER
+   #XSMVER: "v1.99.0","3.3.99","Onomondo 2.1.0"
+   OK
+
+Read command
+------------
+
+The read command is not supported.
+
+Test command
+------------
+
+The test command is not supported.
+
+SM proprietary command list #XCLAC
+==================================
+
+The ``#XCLAC`` command requests the list of the proprietary |SM| commands.
+
+Set command
+-----------
+
+The set command requests the list of the proprietary |SM| commands.
+It is an add-on for ``AT+CLAC``, which lists all modem AT commands.
+
+Syntax
+~~~~~~
+
+::
+
+   AT#XCLAC
+
+Response syntax
+~~~~~~~~~~~~~~~
+
+::
+
+   <command list>
+
+The parameters and their defined values are the following:
+
+<command list>
+   String.
+   A list of values representing all the ``#X*`` commands followed by <CR><LF>.
+
+Example
+~~~~~~~
+
+::
+
+   AT#XCLAC
+   AT#XSMVER
+   AT#XSLEEP
+   AT#XCLAC
+   AT#XSOCKET
+   AT#XBIND
+   AT#XCONNECT
+   AT#XSEND
+   AT#XRECV
+   AT#XSENDTO
+   AT#XRECVFROM
+   AT#XPING
+   AT#XGNSS
+   OK
+
+Read command
+------------
+
+The read command is not supported.
+
+Test command
+------------
+
+The test command is not supported.
+
+Power saving #XSLEEP
+====================
+
+The ``#XSLEEP`` command makes the |SM| application to enter idle or sleep mode.
+
+.. note::
+
+   The ``#XSLEEP`` command is intended for experimentation and power consumption measurements and must not be used in production.
+
+   You can use the DTR (Data Terminal Ready) and RI (Ring Indicator) signals to control the power state of the UART between the |SM| and the host.
+   See the :ref:`uart_configuration` section for more information about DTR and RI.
+
+.. note::
+
+   If you want to do power measurements on the nRF91 Series development kit while running the |SM| application, remember to disable unused peripherals.
+
+
+Set command
+-----------
+
+The set command makes the |SM| application enter either Idle or Sleep mode.
+
+Syntax
+~~~~~~
+
+::
+
+   AT#XSLEEP=<sleep_mode>
+
+The parameters and their defined values are the following:
+
+<sleep_mode>
+   * ``1`` - Enter Sleep.
+     In this mode, both the |SM| service and the LTE connection are terminated.
+
+     |SM| can be woken up using the DTR pin.
+
+   * ``2`` - Enter Idle.
+     In this mode, both the |SM| service and the LTE connection are maintained, but the UART is disabled to save power.
+     Received data is buffered and sent to the host after idle mode is exited.
+
+     |SM| can exit the idle mode using the DTR pin.
+     When the |SM| is in idle mode, and there is data to be read by the host, the RI pin is asserted for a short period of time to notify the host.
+     The host can then deassert and assert DTR to exit idle mode and read the data.
+
+.. only:: not nrf91m1
+
+   The DTR pin is defined either in the :file:`boards/*_ns.overlay` overlay file matching your board or in the :file:`external-mcu.overlay` overlay file, if it is included.
+
+.. note::
+
+   * If the modem is on, entering Sleep mode (by issuing ``AT#XSLEEP=1`` ) sends a ``+CFUN=0`` command to the modem, which causes a write to non-volatile memory (NVM).
+     Take the NVM wear into account, or put the modem in flight mode by issuing ``AT+CFUN=4`` before Sleep mode.
+
+Examples
+~~~~~~~~
+
+::
+
+   AT#XSLEEP=0
+   ERROR
+
+::
+
+   AT#XSLEEP=1
+   OK
+
+See the following for an example of when the modem is on:
+
+::
+
+   AT+CFUN=4
+   OK
+
+   AT#XSLEEP=1
+   OK
+
+::
+
+   AT#XSLEEP=2
+   OK
+
+Read command
+------------
+
+The read command is not supported.
+
+Test command
+------------
+
+The test command tests the existence of the AT command and provides information about the type of its subparameters.
+
+Syntax
+~~~~~~
+
+::
+
+   AT#XSLEEP=?
+
+Response syntax
+~~~~~~~~~~~~~~~
+
+::
+
+   #XSLEEP: <list of shutdown_mode>
+
+Example
+~~~~~~~
+
+::
+
+   AT#XSLEEP=?
+   #XSLEEP: (1,2)
+   OK
+
+Power off #XSHUTDOWN
+====================
+
+The ``#XSHUTDOWN`` command makes the nRF91 Series SiP enter System OFF mode, which is the deepest power saving mode.
+
+Set command
+-----------
+
+The set command makes the nRF91 Series SiP enter System OFF mode.
+
+Syntax
+~~~~~~
+
+::
+
+   AT#XSHUTDOWN
+
+.. note::
+
+   In this case the nRF91 Series SiP cannot be woken up using the DTR pin.
+
+Example
+~~~~~~~~
+
+::
+
+   AT#XSHUTDOWN
+   OK
+
+
+Read command
+------------
+
+The read command is not supported.
+
+Test command
+------------
+
+The test command is not supported.
+
+Reset #XRESET
+=============
+
+The ``#XRESET`` command performs a soft reset of the nRF91 Series SiP.
+
+Set command
+-----------
+
+The set command resets the nRF91 Series SiP.
+
+Syntax
+~~~~~~
+
+::
+
+   AT#XRESET
+
+Example
+~~~~~~~~
+
+::
+
+   AT#XRESET
+   OK
+   Ready
+
+Read command
+------------
+
+The read command is not supported.
+
+Test command
+------------
+
+The test command is not supported.
+
+Modem reset #XMODEMRESET
+========================
+
+The ``#XMODEMRESET`` command performs a reset of the modem.
+
+The modem is set to minimal function mode (via ``+CFUN=0``) before being reset.
+The |SM| application is not restarted.
+After the command returns, the modem will be in minimal function mode.
+
+Set command
+-----------
+
+The set command resets the modem.
+
+Syntax
+~~~~~~
+
+::
+
+   AT#XMODEMRESET
+
+Response syntax
+~~~~~~~~~~~~~~~
+
+::
+
+   #XMODEMRESET: <result>[,<error_code>]
+
+The parameters and their defined values are the following:
+
+<result>
+   * ``0`` - Success.
+   * *Positive value* - On failure, indicates the step that failed.
+
+<error_code>
+   Integer.
+   Only printed when the modem reset was not successful.
+   It is the error code indicating the reason for the failure.
+
+Example
+~~~~~~~~
+
+::
+
+   AT#XMODEMRESET
+
+   #XMODEMRESET: 0
+
+   OK
+
+Read command
+------------
+
+The read command is not supported.
+
+Test command
+------------
+
+The test command is not supported.
+
+Device UUID #XUUID
+==================
+
+The ``#XUUID`` command requests the device UUID.
+
+Set command
+-----------
+
+The set command returns the device UUID.
+
+Syntax
+~~~~~~
+
+::
+
+   AT#XUUID
+
+Response syntax
+~~~~~~~~~~~~~~~
+
+::
+
+   #XUUID: <device-uuid>
+
+The parameters and their defined values are the following:
+
+<device-uuid>
+   String.
+   The UUID of the device.
+
+Example
+~~~~~~~
+
+::
+
+  AT#XUUID
+
+  #XUUID: 50503041-3633-4261-803d-1e2b8f70111a
+
+  OK
+
+Read command
+------------
+
+The read command is not supported.
+
+Test command
+------------
+
+The test command is not supported.
+
+MCUboot bootloader info #XBOOTINFO
+==================================
+
+Query information about the MCUboot second-stage bootloader.
+
+This command is only available when the firmware is built with the NSIB (B0) and MCUboot as a second-stage bootloader.
+
+Set command
+-----------
+
+::
+
+   AT#XBOOTINFO=<op>
+
+The parameters and their defined values are the following:
+
+<op>
+   * ``0`` - Query the firmware version of the active MCUboot slot.
+   * ``1`` - Query which MCUboot slot is currently active.
+
+Response syntax
+~~~~~~~~~~~~~~~
+
+::
+
+   #XBOOTINFO: <value>
+
+The parameters and their defined values are the following:
+
+<value>
+   Integer.
+
+   * When ``<op>`` is ``0``, it is an unsigned integer representing the firmware version of the active MCUboot slot, used by NSIB as a downgrade-protection counter.
+
+     .. only:: not nrf91m1
+
+        The firmware version is set at build time using ``CONFIG_FW_INFO_FIRMWARE_VERSION``.
+
+   * When ``<op>`` is ``1``, it is ``0`` if slot ``s0`` is active and ``1`` if slot ``s1`` is active.
+
+Examples
+~~~~~~~~
+
+Query the firmware version of the active MCUboot slot::
+
+   AT#XBOOTINFO=0
+
+   #XBOOTINFO: 1
+
+   OK
+
+Query the active MCUboot slot::
+
+   AT#XBOOTINFO=1
+
+   #XBOOTINFO: 0
+
+   OK
+
+Test command
+------------
+
+::
+
+   AT#XBOOTINFO=?
+
+Response syntax
+~~~~~~~~~~~~~~~
+
+::
+
+   #XBOOTINFO: (0,1)
+
+Example
+~~~~~~~
+
+::
+
+   AT#XBOOTINFO=?
+   #XBOOTINFO: (0,1)
+   OK
+
+Modem fault #XMODEM
+===================
+
+The application monitors the modem status.
+When the application detects a *modem fault*, it sends the ``#XMODEM`` unsolicited notification.
+
+Unsolicited notification
+------------------------
+
+The application sends the following unsolicited notification when it detects a modem fault:
+
+::
+
+   #XMODEM: FAULT,<reason>,<program_count>
+
+The parameters and their defined values are the following:
+
+<reason>
+   Integer.
+   A hexadecimal integer indicating the reason of the modem fault.
+
+<program_count>
+   Integer.
+   A hexadecimal integer indicating the address of the modem fault.
+
+The application sends the following unsolicited notification when it shuts down libmodem:
+
+::
+
+   #XMODEM: SHUTDOWN,<result>
+
+The parameters and their defined values are the following:
+
+<result>
+   Integer.
+   The result of the shutdown of libmodem.
+
+The application sends the following unsolicited notification when it re-initializes libmodem:
+
+::
+
+   #XMODEM: INIT,<result>
+
+The parameters and their defined values are the following:
+
+<result>
+   Integer.
+   The result of the re-initialization of libmodem.
+
+.. note::
+   After libmodem is re-initialized, the MCU side must restart the current active service as follows:
+
+   1. Stopping the service.
+      For example, disconnecting the TCP connection and closing the socket.
+   #. Connecting again using LTE.
+   #. Restarting the service.
+      For example, opening the socket and re-establishing the TCP connection.
+
+.. _SM_AT_DBGSTATSMEM:
+
+Memory statistics #XDBGSTATSMEM
+===============================
+
+.. note::
+
+   This AT command is `Experimental <Software maturity levels_>`_.
+
+Print heap and thread stack memory statistics to the log at the ``INF`` level.
+Since this is using the logging as an output, you must enable logging first by issuing the ``AT#XLOG=1`` command.
+
+The following statistics are printed:
+
+* System heap (``malloc`` heap) - Free bytes, allocated bytes, and peak allocated bytes.
+* Kernel heap (``k_malloc`` heap) - Free bytes, allocated bytes, and peak allocated bytes.
+
+.. only:: not nrf91m1
+
+   * Kernel heap block information - This is only available when the ``CONFIG_SYS_HEAP_INFO`` Kconfig option is enabled.
+   * Thread stack usage statistics:
+
+     * This is only available when the :ref:`CONFIG_SM_DEBUG_STATS_THREAD_STACK <CONFIG_SM_DEBUG_STATS_THREAD_STACK>` Kconfig option is enabled.
+     * Setting the ``CONFIG_LOG_BUFFER_SIZE`` Kconfig option to 2048 or more is required to avoid dropping some of the log entries showing stack usage statistics.
+
+   This command is available when the firmware is built with the :ref:`CONFIG_SM_DEBUG_STATS_HEAP <CONFIG_SM_DEBUG_STATS_HEAP>` Kconfig option enabled.
+   In addition, the ``CONFIG_LOG`` Kconfig option and the ``CONFIG_SM_LOG_LEVEL_DBG`` or ``CONFIG_SM_LOG_LEVEL_INF`` Kconfig option must be enabled.
+
+Set command
+-----------
+
+::
+
+   AT#XDBGSTATSMEM
+
+The command prints memory statistics to the log and returns ``OK``.
+No memory information is returned in the AT response.
+
+Read command
+------------
+
+The read command is not supported.
+
+Test command
+------------
+
+The test command is not supported.
+
+Example
+-------
+
+Query memory statistics:
+::
+
+   AT#XLOG=1
+   OK
+   AT#XDBGSTATSMEM
+   OK
+
+These commands will print the following output in the log:
+::
+
+   [00:00:36.270,965] <inf> sm_at: System heap stats:
+   [00:00:36.270,996] <inf> sm_at:   free:            45844
+   [00:00:36.270,996] <inf> sm_at:   allocated:         472
+   [00:00:36.271,026] <inf> sm_at:   max. allocated:    472
+   [00:00:36.271,026] <inf> sm_at: Kernel heap stats:
+   [00:00:36.271,057] <inf> sm_at:   free:             1892
+   [00:00:36.271,057] <inf> sm_at:   allocated:           0
+   [00:00:36.271,057] <inf> sm_at:   max. allocated:   1280
+
+.. only:: not nrf91m1
+
+   The output appears as follows when :ref:`CONFIG_SM_DEBUG_STATS_THREAD_STACK <CONFIG_SM_DEBUG_STATS_THREAD_STACK>` and ``CONFIG_SYS_HEAP_INFO`` Kconfig options are enabled.
+
+   ::
+
+      [00:01:16.852,478] <inf> sm_at: System heap stats:
+      [00:01:16.853,393] <inf> sm_at:   free:            48292
+      [00:01:16.854,431] <inf> sm_at:   allocated:         472
+      [00:01:16.855,438] <inf> sm_at:   max. allocated:   1344
+      [00:01:16.856,445] <inf> sm_at: Kernel heap stats:
+      [00:01:16.857,360] <inf> sm_at:   free:             1892
+      [00:01:16.858,398] <inf> sm_at:   allocated:           0
+      [00:01:16.859,405] <inf> sm_at:   max. allocated:   1280
+      [00:01:16.860,412] <inf> sm_at: Kernel heap block information:
+      Heap at 0x20028d40 contains 245 units in 8 buckets
+
+      bucket#    min units        total      largest      largest
+                 threshold       chunks      (units)      (bytes)
+      -----------------------------------------------------------
+            7          128            1          237         1896
+
+      Chunk dump:
+      chunk    0: [*] size=8    left=0    right=8
+      chunk    8: [-] size=237  left=0    right=245
+      chunk  245: [*] size=0    left=8    right=245
+
+      1892 free bytes, 0 allocated bytes, overhead = 72 bytes (3.7%)
+      [00:01:16.869,781] <inf> sm_at: Thread stack stats:
+      Thread analyze:
+       ppp_tx              : STACK: unused 796 usage 228 / 1024 (22 %); CPU: 0 %
+                           : Total CPU cycles used: 2
+       trace_thread        : STACK: unused 460 usage 308 / 768 (40 %); CPU: 0 %
+                           : Total CPU cycles used: 3
+       coap_client_recv_thread: STACK: unused 1276 usage 772 / 2048 (37 %); CPU: 0 %
+                           : Total CPU cycles used: 67
+       nrf_provisioning_work_q: STACK: unused 1812 usage 236 / 2048 (11 %); CPU: 0 %
+                           : Total CPU cycles used: 2
+       date_time_work_q    : STACK: unused 492 usage 788 / 1280 (61 %); CPU: 0 %
+                           : Total CPU cycles used: 32
+       ppp_data_passing    : STACK: unused 1564 usage 484 / 2048 (23 %); CPU: 0 %
+                           : Total CPU cycles used: 2
+       downloader          : STACK: unused 3844 usage 252 / 4096 (6 %); CPU: 0 %
+                           : Total CPU cycles used: 2
+       net_mgmt            : STACK: unused 596 usage 204 / 800 (25 %); CPU: 0 %
+                           : Total CPU cycles used: 1
+       sysworkq            : STACK: unused 3180 usage 916 / 4096 (22 %); CPU: 0 %
+                           : Total CPU cycles used: 475
+       idle                : STACK: unused 252 usage 68 / 320 (21 %); CPU: 99 %
+                           : Total CPU cycles used: 2506299
+       sm_work_q           : STACK: unused 812 usage 3284 / 4096 (80 %); CPU: 0 %
+                           : Total CPU cycles used: 4467
+       ISR0                : STACK: unused 1588 usage 460 / 2048 (22 %); CPU: 0 %
+                           : Total CPU cycles used: 0

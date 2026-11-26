@@ -1,0 +1,131 @@
+/*
+ * Copyright (c) 2021 Nordic Semiconductor ASA
+ *
+ * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+ */
+
+#include <zephyr/logging/log.h>
+#include <string.h>
+#include <zephyr/kernel.h>
+#include <zephyr/settings/settings.h>
+#include <dfu/dfu_target.h>
+#include <errno.h>
+#include "sm_at_fota.h"
+#include "sm_at_dfu.h"
+#include "sm_settings.h"
+#include "sm_defines.h"
+
+LOG_MODULE_REGISTER(sm_settings, CONFIG_SM_LOG_LEVEL);
+
+static int settings_set(const char *name, size_t len, settings_read_cb read_cb, void *cb_arg)
+{
+	if (!strcmp(name, "bootloader_mode_requested")) {
+		if (len != sizeof(sm_bootloader_mode_requested))
+			return -EINVAL;
+		if (read_cb(cb_arg, &sm_bootloader_mode_requested, len) > 0)
+			return 0;
+	}
+	if (!strcmp(name, "full_mfw_dfu_segment_type")) {
+		if (len != sizeof(full_mfw_dfu_segment_type))
+			return -EINVAL;
+		if (read_cb(cb_arg, &full_mfw_dfu_segment_type, len) > 0)
+			return 0;
+	}
+	if (!strcmp(name, "bl_fota_ver")) {
+		if (len != sizeof(sm_fota_bl_version_before))
+			return -EINVAL;
+		if (read_cb(cb_arg, &sm_fota_bl_version_before, len) > 0)
+			return 0;
+	}
+	if (!strcmp(name, "fota_type")) {
+		if (len != sizeof(sm_fota_type))
+			return -EINVAL;
+		if (read_cb(cb_arg, &sm_fota_type, len) > 0)
+			return 0;
+	}
+	if (!strcmp(name, "modem_eio_retried")) {
+		if (len != sizeof(sm_modem_init_eio_retry_count))
+			return -EINVAL;
+		if (read_cb(cb_arg, &sm_modem_init_eio_retry_count, len) > 0)
+			return 0;
+	}
+	if (!strcmp(name, "fota_nrfcloud")) {
+		if (len != sizeof(sm_fota_nrfcloud))
+			return -EINVAL;
+		if (read_cb(cb_arg, &sm_fota_nrfcloud, len) > 0)
+			return 0;
+	}
+	/* Simply ignore obsolete settings that are not in use anymore.
+	 * settings_delete() does not completely remove settings.
+	 */
+	return 0;
+}
+
+static struct settings_handler sm_settings_conf = {
+	.name = "sm",
+	.h_set = settings_set
+};
+
+static int sm_settings_init(void)
+{
+	int ret;
+
+	ret = settings_subsys_init();
+	if (ret) {
+		LOG_ERR("Settings init failed: %d", ret);
+		sm_init_failed = true;
+		return ret;
+	}
+	ret = settings_register(&sm_settings_conf);
+	if (ret) {
+		LOG_ERR("Settings register failed: %d", ret);
+		sm_init_failed = true;
+		return ret;
+	}
+	ret = settings_load_subtree("sm");
+	if (ret) {
+		LOG_ERR("Settings load failed: %d", ret);
+		sm_init_failed = true;
+	}
+
+	return ret;
+}
+/* Run before APPLICATION init functions, so modules can use settings that are load from
+ * flash
+ */
+SYS_INIT(sm_settings_init, POST_KERNEL, CONFIG_APPLICATION_INIT_PRIORITY);
+
+int sm_settings_fota_save(void)
+{
+	int err;
+
+	err = settings_save_one("sm/bl_fota_ver", &sm_fota_bl_version_before,
+				 sizeof(sm_fota_bl_version_before));
+	if (err) {
+		return err;
+	}
+	err = settings_save_one("sm/fota_type", &sm_fota_type, sizeof(sm_fota_type));
+	if (err) {
+		return err;
+	}
+	return settings_save_one("sm/fota_nrfcloud", &sm_fota_nrfcloud,
+				 sizeof(sm_fota_nrfcloud));
+}
+
+int sm_settings_bootloader_mode_save(void)
+{
+	return settings_save_one("sm/bootloader_mode_requested",
+		&sm_bootloader_mode_requested, sizeof(sm_bootloader_mode_requested));
+}
+
+int sm_settings_full_mfw_dfu_segment_type_save(void)
+{
+	return settings_save_one("sm/full_mfw_dfu_segment_type",
+		&full_mfw_dfu_segment_type, sizeof(full_mfw_dfu_segment_type));
+}
+
+int sm_settings_modem_eio_retried_save(void)
+{
+	return settings_save_one("sm/modem_eio_retried",
+		&sm_modem_init_eio_retry_count, sizeof(sm_modem_init_eio_retry_count));
+}

@@ -1,0 +1,240 @@
+sample:
+  name: Serial Modem
+tests:
+  serial_modem.nrf91m1:
+    sysbuild: true
+    build_only: true
+    extra_args:
+      - EXTRA_CONF_FILE="cmux.conf;ppp.conf;trace-backend-uart.conf;nrf-device-provisioning.conf"
+      - EXTRA_DTC_OVERLAY_FILE="nrf91m1.overlay;trace-backend-nrf9151.overlay"
+    extra_configs:
+      - CONFIG_SM_DFU_MODEM_FULL=y
+    platform_allow:
+      - nrf9151dk/nrf9151/ns
+  serial_modem.default:
+    sysbuild: true
+    build_only: true
+    platform_allow:
+      - nrf9151dk/nrf9151/ns
+      - thingy91x/nrf9151/ns
+    integration_platforms:
+      - thingy91x/nrf9151/ns
+  serial_modem.minimal:
+    sysbuild: true
+    build_only: true
+    platform_allow:
+      - nrf9151dk/nrf9151/ns
+      - thingy91x/nrf9151/ns
+    extra_configs:
+      - CONFIG_SM_NRF_CLOUD=n
+      - CONFIG_SM_SMS=n
+      - CONFIG_SM_GNSS=n
+      - CONFIG_SM_COAPC=n
+      - CONFIG_SM_MQTTC=n
+      - CONFIG_SM_DEBUG_STATS_HEAP=n
+      - CONFIG_SM_HTTPC=n
+    tags: exclude_integration
+  serial_modem.extmcu:
+    sysbuild: true
+    build_only: true
+    extra_args:
+      - EXTRA_DTC_OVERLAY_FILE="external-mcu.overlay"
+    platform_allow:
+      - nrf9151dk/nrf9151/ns
+    tags: exclude_integration
+  serial_modem.interposer_nrf9151_mk_bg95:
+    sysbuild: true
+    build_only: true
+    extra_args:
+      - EXTRA_CONF_FILE="cmux.conf;ppp.conf;trace-backend-uart.conf;nrf-device-provisioning.conf"
+      - EXTRA_DTC_OVERLAY_FILE="interposer-nrf9151-mk-bg95.overlay;trace-backend-nrf9151.overlay"
+    extra_configs:
+      - CONFIG_SM_DFU_MODEM_FULL=y
+    platform_allow:
+      - nrf9151dk/nrf9151/ns
+    tags: exclude_integration
+  serial_modem.interposer_nrf9151_mk_gm02s:
+    sysbuild: true
+    build_only: true
+    extra_args:
+      - EXTRA_CONF_FILE="cmux.conf;ppp.conf;trace-backend-uart.conf;nrf-device-provisioning.conf"
+      - EXTRA_DTC_OVERLAY_FILE="interposer-nrf9151-mk-gm02s.overlay;trace-backend-nrf9151.overlay"
+    extra_configs:
+      - CONFIG_SM_DFU_MODEM_FULL=y
+    platform_allow:
+      - nrf9151dk/nrf9151/ns
+    tags: exclude_integration
+  serial_modem.no_dtr:
+    sysbuild: true
+    build_only: true
+    extra_args:
+      - EXTRA_DTC_OVERLAY_FILE="disable-dtr.overlay"
+    platform_allow:
+      - nrf9151dk/nrf9151/ns
+      - thingy91x/nrf9151/ns
+    tags: exclude_integration
+  serial_modem.ppp_without_cmux:
+    sysbuild: true
+    build_only: true
+    extra_args:
+      - EXTRA_CONF_FILE="ppp.conf"
+    platform_allow:
+      - nrf9151dk/nrf9151/ns
+      - thingy91x/nrf9151/ns
+    integration_platforms:
+      - nrf9151dk/nrf9151/ns
+    tags: exclude_integration
+  serial_modem.ppp_cmux:
+    sysbuild: true
+    build_only: true
+    extra_args:
+      - EXTRA_CONF_FILE="cmux.conf;ppp.conf"
+    platform_allow:
+      - nrf9151dk/nrf9151/ns
+      - thingy91x/nrf9151/ns
+    tags: exclude_integration
+  serial_modem.ppp_cmux_with_modem_trace:
+    sysbuild: true
+    build_only: true
+    extra_args:
+      - EXTRA_CONF_FILE="cmux.conf;ppp.conf;trace-backend-cmux.conf"
+      - EXTRA_DTC_OVERLAY_FILE="trace-backend-nrf9151.overlay"
+    platform_allow:
+      - nrf9151dk/nrf9151/ns
+      - thingy91x/nrf9151/ns
+    integration_platforms:
+      - nrf9151dk/nrf9151/ns
+    tags: exclude_integration
+  serial_modem.no_nrfcloud:
+    sysbuild: true
+    build_only: true
+    extra_configs:
+      - CONFIG_SM_NRF_CLOUD=n
+    platform_allow:
+      - nrf9151dk/nrf9151/ns
+    tags: exclude_integration
+  serial_modem.no_nrfcloud_memfault:
+    sysbuild: true
+    build_only: true
+    extra_configs:
+      - CONFIG_SM_NRF_CLOUD_OBSERVABILITY=n
+      - CONFIG_SM_NRF_CLOUD_FOTA=n
+    platform_allow:
+      - nrf9151dk/nrf9151/ns
+    tags: exclude_integration
+  serial_modem.no_nrfcloud_observability:
+    sysbuild: true
+    build_only: true
+    extra_configs:
+      - CONFIG_SM_NRF_CLOUD_OBSERVABILITY=n
+    platform_allow:
+      - nrf9151dk/nrf9151/ns
+    tags: exclude_integration
+  serial_modem.no_nrfcloud_fota:
+    sysbuild: true
+    build_only: true
+    extra_configs:
+      - CONFIG_SM_NRF_CLOUD_FOTA=n
+    platform_allow:
+      - nrf9151dk/nrf9151/ns
+    tags: exclude_integration
+  serial_modem.mfw_full_fota_and_dfu:
+    sysbuild: true
+    build_only: true
+    extra_args:
+      - EXTRA_CONF_FILE="full-fota.conf"
+      - EXTRA_DTC_OVERLAY_FILE="full-fota-nrf9151.overlay"
+    extra_configs:
+      - CONFIG_SM_DFU_MODEM_FULL=y
+    platform_allow:
+      - nrf9151dk/nrf9151/ns
+    tags: exclude_integration
+  serial_modem.pgps_agnss:
+    sysbuild: true
+    build_only: true
+    extra_args:
+      - EXTRA_DTC_OVERLAY_FILE="pgps-nrf9151.overlay"
+      - mcuboot_EXTRA_DTC_OVERLAY_FILE="${APP_DIR}/pgps-nrf9151.overlay"
+    extra_configs:
+      - CONFIG_NRF_CLOUD_PGPS=y
+      - CONFIG_NRF_CLOUD_GPS_LOG_LEVEL_INF=y
+    platform_allow:
+      - nrf9151dk/nrf9151/ns
+    tags: exclude_integration
+  serial_modem.pgps_no_agnss:
+    sysbuild: true
+    build_only: true
+    extra_args:
+      - EXTRA_DTC_OVERLAY_FILE="pgps-nrf9151.overlay"
+      - mcuboot_EXTRA_DTC_OVERLAY_FILE="${APP_DIR}/pgps-nrf9151.overlay"
+    extra_configs:
+      - CONFIG_NRF_CLOUD_PGPS=y
+      - CONFIG_NRF_CLOUD_AGNSS=n
+      - CONFIG_NRF_CLOUD_GPS_LOG_LEVEL_INF=y
+    platform_allow:
+      - nrf9151dk/nrf9151/ns
+    tags: exclude_integration
+  serial_modem.lwm2m_carrier:
+    sysbuild: true
+    build_only: true
+    extra_args:
+      - EXTRA_CONF_FILE="carrier.conf"
+      - EXTRA_DTC_OVERLAY_FILE="carrier-nrf9151.overlay"
+    platform_allow:
+      - nrf9151dk/nrf9151/ns
+    integration_platforms:
+      - nrf9151dk/nrf9151/ns
+    tags: exclude_integration
+  serial_modem.lwm2m_carrier.softbank:
+    sysbuild: true
+    build_only: true
+    extra_args:
+      - EXTRA_CONF_FILE="carrier.conf;carrier-softbank.conf"
+      - EXTRA_DTC_OVERLAY_FILE="carrier-nrf9151.overlay"
+      - SB_EXTRA_CONF_FILE=sysbuild-softbank.conf
+    platform_allow:
+      - nrf9151dk/nrf9151/ns
+    tags: exclude_integration
+  serial_modem.lwm2m_carrier.lgu:
+    sysbuild: true
+    build_only: true
+    extra_args:
+      - EXTRA_CONF_FILE="carrier.conf;carrier-lgu.conf"
+      - EXTRA_DTC_OVERLAY_FILE="carrier-nrf9151.overlay"
+    platform_allow:
+      - nrf9151dk/nrf9151/ns
+    tags: exclude_integration
+  serial_modem.auto_connect:
+    sysbuild: true
+    build_only: true
+    extra_configs:
+      - CONFIG_SM_AUTO_CONNECT=y
+      - CONFIG_SM_AUTO_CONNECT_SYSTEM_MODE="1,0,0,0"
+      - CONFIG_SM_AUTO_CONNECT_PDN_CONFIG=y
+      - CONFIG_SM_AUTO_CONNECT_PDN_APN="internet"
+      - CONFIG_SM_AUTO_CONNECT_PDN_FAMILY_IP=y
+      - CONFIG_SM_AUTO_CONNECT_PDN_AUTH=1
+      - CONFIG_SM_AUTO_CONNECT_PDN_USERNAME="myuser"
+      - CONFIG_SM_AUTO_CONNECT_PDN_PASSWORD="mypassword"
+    platform_allow:
+      - nrf9151dk/nrf9151/ns
+    tags: exclude_integration
+  serial_modem.disable_b0:
+    sysbuild: true
+    build_only: true
+    extra_args:
+      - EXTRA_DTC_OVERLAY_FILE="disable-b0-nrf9151.overlay"
+      - mcuboot_EXTRA_DTC_OVERLAY_FILE="${APP_DIR}/disable-b0-nrf9151.overlay"
+      - SB_CONFIG_SECURE_BOOT_APPCORE=n
+    platform_allow:
+      - nrf9151dk/nrf9151/ns
+  serial_modem.debug_stats_stacks:
+    sysbuild: true
+    build_only: true
+    extra_configs:
+      - CONFIG_SM_DEBUG_STATS_THREAD_STACK=y
+      - CONFIG_SYS_HEAP_INFO=y
+      - CONFIG_LOG_BUFFER_SIZE=2048
+    platform_allow:
+      - nrf9151dk/nrf9151/ns
+    tags: exclude_integration

@@ -1,0 +1,576 @@
+/*
+ * Copyright (c) 2019 Nordic Semiconductor ASA
+ *
+ * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+ */
+#include <assert.h>
+#include <ctype.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <zephyr/net/net_ip.h>
+#include <zephyr/storage/flash_map.h>
+#include <nrf_errno.h>
+#include <nrf_modem_at.h>
+#include "sm_util.h"
+#include <fw_info.h>
+#include <tfm/tfm_ioctl_api.h>
+
+LOG_MODULE_REGISTER(sm_util, CONFIG_SM_LOG_LEVEL);
+
+static bool cmd_name_has_lower(const char *cmd)
+{
+	for (size_t i = 0; cmd[i] != '\0'; ++i) {
+		const char c = cmd[i];
+
+		/* Set/test command names are delimited by '=', read by '?'. */
+		if (c == '=' || c == '?') {
+			break;
+		} else if (islower(c)) {
+			LOG_ERR("FIX ME: AT command \"%.*s\" must be all-uppercase",
+				(int)strcspn(cmd, "=?,\r\n"), cmd);
+			return true;
+		}
+	}
+	return false;
+}
+
+int sm_util_at_printf(const char *fmt, ...)
+{
+	int ret;
+	char buf[128];
+	va_list args;
+
+	va_start(args, fmt);
+	ret = vsnprintf(buf, sizeof(buf), fmt, args);
+	va_end(args);
+	if (ret >= sizeof(buf)) {
+		LOG_ERR("AT cmd \"%.*s...\" too long len=%u max=%u",
+			(int)MIN(strcspn(buf, "=?,\r\n"), 16U), buf, ret, sizeof(buf) - 1);
+		return -E2BIG;
+	}
+
+	/* AT command interception is case-sensitive. */
+	if (cmd_name_has_lower(buf)) {
+		return -EINVAL;
+	}
+
+	/* Even though we are not interested in the AT response, it must fit
+	 * into the provided buffer so that the response code is returned.
+	 */
+	ret = nrf_modem_at_cmd(buf, sizeof(buf), "%s", buf);
+	if (ret == -NRF_E2BIG) {
+		/* Unlikely, but in that case the response code most likely didn't
+		 * make it into the buffer, so searching for it would be fruitless.
+		 */
+		LOG_ERR("AT response to \"%.*s\" truncated at %u B", (int)strcspn(fmt, "=?,\r\n"),
+			fmt, sizeof(buf) - 1);
+	}
+	return ret;
+}
+
+int sm_util_at_scanf(const char *cmd, const char *fmt, ...)
+{
+	char buf[256];
+	va_list args;
+	int ret;
+
+	/* AT command interception is case-sensitive. */
+	if (cmd_name_has_lower(cmd)) {
+		return -EINVAL;
+	}
+
+	ret = nrf_modem_at_cmd(buf, sizeof(buf), "%s", cmd);
+	if (ret == -NRF_E2BIG) {
+		LOG_ERR("AT response to \"%.*s\" truncated at %u B", (int)strcspn(cmd, "=?,\r\n"),
+			cmd, sizeof(buf) - 1);
+		buf[sizeof(buf) - 1] = '\0';
+	} else if (ret < 0) {
+		return ret;
+	}
+
+	va_start(args, fmt);
+	ret = vsscanf(buf, fmt, args);
+	va_end(args);
+
+	if (ret == 0) {
+		ret = -NRF_EBADMSG;
+	}
+	return ret;
+}
+
+static int terminate_at_response(char *buf, size_t len,
+				 const char *termination_str, int success_ret)
+{
+	len -= strlen(buf);
+	const int printf_ret = snprintf(buf + strlen(buf), len, "%s", termination_str);
+
+	if (printf_ret >= len) {
+		LOG_ERR("AT response truncated: %u B", printf_ret - len + 1);
+		return -NRF_E2BIG;
+	}
+	return success_ret;
+}
+
+int sm_util_at_cmd_no_intercept(char *buf, size_t len, const char *at_cmd)
+{
+	int ret;
+	char second_line[strlen("+CMx ERROR: xxxx")];
+	char format_str[24];
+
+	/* Construct the format string to read two response lines (into buf and second_line).
+	 * The buffer sizes are put in the format string to prevent overflows.
+	 * Negated scansets are used to read whole lines (everything up to '\r').
+	 * See the scanf() format specifer documentation for more information.
+	 */
+	ret = snprintf(format_str, sizeof(format_str),
+		       "%%%u[^\r]\r\n%%%u[^\r]", len - 1, sizeof(second_line) - 1);
+	assert(ret < sizeof(format_str));
+
+	LOG_DBG("Forwarding \"%s\" to modem", at_cmd);
+
+/* This function gets called by interception callbacks invoked by nrf_modem_at_cmd().
+ * Here nrf_modem_at_cmd() must be bypassed because it would otherwise call
+ * the same interception callbacks and infinite recursion would happen.
+ */
+#undef nrf_modem_at_scanf
+	const int line_count = nrf_modem_at_scanf(at_cmd, format_str, buf, second_line);
+
+/* Restore the trap macro after the only place where this function is
+ * allowed to be used so that other code does not accidentally use it.
+ */
+#define nrf_modem_at_scanf nrf_modem_at_printf
+
+	if (line_count < 1) {
+		LOG_ERR("Forwarding \"%.*s\" failed: %d", (int)strcspn(at_cmd, "=?,\r\n"),
+			at_cmd, line_count);
+		return line_count;
+	}
+
+	/* The line that is expected to contain the response code. */
+	const char *const resp_str = (line_count == 1) ? buf : second_line;
+
+#define AT_ERROR (NRF_MODEM_AT_ERROR << 16)
+	assert(nrf_modem_at_err_type(AT_ERROR) == NRF_MODEM_AT_ERROR);
+
+	/* Reconstruct the response string and code from the parsed response line(s). */
+	if (!strcmp(resp_str, "OK")) {
+		/* The command succeeded and its response is no longer than two lines. */
+		ret = terminate_at_response(buf, len, (line_count == 1) ? "\r\n" : "\r\nOK\r\n", 0);
+	} else {
+		/* Is there an error in the first response line? */
+		if (!(line_count == 1 && strstr(resp_str, "ERROR"))) {
+			/* No. Overwrite the whole response with "ERROR". */
+			buf[0] = '\0';
+		}
+		ret = terminate_at_response(buf, len, buf[0] ? "\r\n" : "ERROR\r\n", AT_ERROR);
+	}
+	return ret;
+}
+
+bool sm_util_casecmp(const char *str1, const char *str2)
+{
+	int str2_len = strlen(str2);
+
+	if (strlen(str1) != str2_len) {
+		return false;
+	}
+
+	for (int i = 0; i < str2_len; i++) {
+		if (toupper((int)*(str1 + i)) != toupper((int)*(str2 + i))) {
+			return false;
+		}
+	}
+
+	return true;
+}
+
+int util_string_get(struct at_parser *parser, size_t index, char *value, size_t *len)
+{
+	int ret;
+	size_t size = *len;
+
+	/* at_parser_string_get calls "memcpy" instead of "strcpy" */
+	ret = at_parser_string_get(parser, index, value, len);
+	if (ret) {
+		return ret;
+	}
+	if (*len < size) {
+		*(value + *len) = '\0';
+		return 0;
+	}
+
+	return -ENOMEM;
+}
+
+int util_string_to_float_get(struct at_parser *parser, size_t index, float *value)
+{
+	int ret;
+	char str[32];
+	size_t len = sizeof(str);
+
+	ret = util_string_get(parser, index, str, &len);
+	if (ret) {
+		return ret;
+	}
+
+	*value = strtof(str, NULL);
+
+	return 0;
+}
+
+int util_string_to_double_get(struct at_parser *parser, size_t index, double *value)
+{
+	int ret;
+	char str[32];
+	size_t len = sizeof(str);
+
+	ret = util_string_get(parser, index, str, &len);
+	if (ret) {
+		return ret;
+	}
+
+	*value = strtod(str, NULL);
+
+	return 0;
+}
+
+void util_get_ip_addr(int cid, char addr4[NET_INET_ADDRSTRLEN], char addr6[NET_INET6_ADDRSTRLEN])
+{
+	int ret;
+	char cmd[32];
+	char tmp[sizeof(struct net_in6_addr)];
+	char addr1[NET_INET6_ADDRSTRLEN];
+	char addr2[NET_INET6_ADDRSTRLEN];
+
+	if (addr4) {
+		addr4[0] = '\0';
+	}
+	if (addr6) {
+		addr6[0] = '\0';
+	}
+	sprintf(cmd, "AT+CGPADDR=%d", cid);
+	/** parse +CGPADDR: <cid>,<PDP_addr_1>,<PDP_addr_2>
+	 * PDN type "IP": PDP_addr_1 is <IPv4>, max 16(NET_INET_ADDRSTRLEN), '.' and digits
+	 * PDN type "IPV6": PDP_addr_1 is <IPv6>, max 46(NET_INET6_ADDRSTRLEN),':', digits, 'A'~'F'
+	 * PDN type "IPV4V6": <IPv4>,<IPv6> or <IPV4> or <IPv6>
+	 */
+	ret = sm_util_at_scanf(cmd, "+CGPADDR: %*d,\"%45[.:0-9A-F]\",\"%45[:0-9A-F]\"",
+				 addr1, addr2);
+	if (ret <= 0) {
+		return;
+	}
+	if (addr4 != NULL && zsock_inet_pton(NET_AF_INET, addr1, tmp) == 1) {
+		strcpy(addr4, addr1);
+	} else if (addr6 != NULL && zsock_inet_pton(NET_AF_INET6, addr1, tmp) == 1) {
+		strcpy(addr6, addr1);
+		return;
+	}
+	/* parse second IP string, IPv6 only */
+	if (addr6 == NULL) {
+		return;
+	}
+	if (ret > 1 && zsock_inet_pton(NET_AF_INET6, addr2, tmp) == 1) {
+		strcpy(addr6, addr2);
+	}
+}
+
+int util_str_to_int(const char *str_buf, int base, int *output)
+{
+	int temp;
+	char *end_ptr = NULL;
+
+	errno = 0;
+	temp = strtol(str_buf, &end_ptr, base);
+
+	if (end_ptr == str_buf || *end_ptr != '\0' ||
+	    ((temp == LONG_MAX || temp == LONG_MIN) && errno == ERANGE)) {
+		return -ENODATA;
+	}
+
+	*output = temp;
+	return 0;
+}
+
+#define PORT_MAX_SIZE    5 /* 0xFFFF = 65535 */
+#define PDN_ID_MAX_SIZE  2 /* 0..10 */
+
+int util_resolve_host(int cid, const char *host, uint16_t port, int family, struct net_sockaddr *sa)
+{
+	int err;
+	char service[PORT_MAX_SIZE + PDN_ID_MAX_SIZE + 2];
+	struct zsock_addrinfo *ai = NULL;
+	struct zsock_addrinfo hints = {
+		.ai_flags  = ZSOCK_AI_NUMERICSERV | AI_PDNSERV,
+		.ai_family = family
+	};
+
+	if (sa == NULL) {
+		return DNS_EAI_AGAIN;
+	}
+
+	/* "service" shall be formatted as follows: "port:pdn_id" */
+	snprintf(service, sizeof(service), "%hu:%d", port, cid);
+	err = zsock_getaddrinfo(host, service, &hints, &ai);
+	if (!err) {
+		*sa = *(ai->ai_addr);
+		zsock_freeaddrinfo(ai);
+
+		if (sa->sa_family != NET_AF_INET && sa->sa_family != NET_AF_INET6) {
+			err = DNS_EAI_ADDRFAMILY;
+		}
+	}
+
+	if (err) {
+		const char *errstr;
+
+		if (err == DNS_EAI_SYSTEM) {
+			errstr = strerror(errno);
+			err = errno;
+		} else {
+			errstr = zsock_gai_strerror(err);
+		}
+		LOG_ERR("zsock_getaddrinfo() error: %d %s", err, errstr);
+	}
+	return err;
+}
+
+int util_get_peer_addr(struct net_sockaddr *peer, char addr[static NET_INET6_ADDRSTRLEN],
+		       uint16_t *port)
+{
+	const char *ret = NULL;
+
+	if (peer->sa_family == NET_AF_INET) {
+		ret = zsock_inet_ntop(NET_AF_INET, &((struct net_sockaddr_in *)peer)->sin_addr,
+				addr, NET_INET6_ADDRSTRLEN);
+		*port = net_ntohs(((struct net_sockaddr_in *)peer)->sin_port);
+	} else {
+		ret = zsock_inet_ntop(NET_AF_INET6, &((struct net_sockaddr_in6 *)peer)->sin6_addr,
+				addr, NET_INET6_ADDRSTRLEN);
+		*port = net_ntohs(((struct net_sockaddr_in6 *)peer)->sin6_port);
+	}
+
+	if (ret == NULL) {
+		LOG_ERR("zsock_inet_ntop() error: %d", -errno);
+		return -errno;
+	}
+
+	return 0;
+}
+
+int sm_util_pdn_id_get(uint8_t cid)
+{
+	int ret;
+	char cmd[32];
+	int pdn_id;
+
+	sprintf(cmd, "AT%%XGETPDNID=%u", cid);
+
+	ret = sm_util_at_scanf(cmd, "%%XGETPDNID: %d", &pdn_id);
+	if (ret < 0) {
+		LOG_ERR("PDN ID get failed cid=%d err=%d", cid, ret);
+		return ret;
+	}
+
+	return pdn_id;
+}
+
+static int pdn_sa_family_from_ip_string(const char *src)
+{
+	char buf[NET_INET6_ADDRSTRLEN];
+
+	if (zsock_inet_pton(NET_AF_INET, src, buf)) {
+		return NET_AF_INET;
+	} else if (zsock_inet_pton(NET_AF_INET6, src, buf)) {
+		return NET_AF_INET6;
+	}
+	return -1;
+}
+
+/** @brief Fill PDN dynamic info with DNS addresses adnd mtu. */
+static void pdn_dynamic_info_dns_addr_fill(struct sm_pdn_dynamic_info *pdn_info, uint32_t mtu,
+					   const char *dns_addr_str_primary,
+					   const char *dns_addr_str_secondary)
+{
+	const int family = pdn_sa_family_from_ip_string(dns_addr_str_primary);
+
+	if (family == NET_AF_INET) {
+		(void)zsock_inet_pton(NET_AF_INET, dns_addr_str_primary,
+				      &(pdn_info->dns_addr4_primary));
+		(void)zsock_inet_pton(NET_AF_INET, dns_addr_str_secondary,
+				      &(pdn_info->dns_addr4_secondary));
+		pdn_info->ipv4_mtu = mtu;
+	} else if (family == NET_AF_INET6) {
+		(void)zsock_inet_pton(NET_AF_INET6, dns_addr_str_primary,
+				      &(pdn_info->dns_addr6_primary));
+		(void)zsock_inet_pton(NET_AF_INET6, dns_addr_str_secondary,
+				      &(pdn_info->dns_addr6_secondary));
+		pdn_info->ipv6_mtu = mtu;
+	}
+}
+
+#define AT_CMD_PDN_CONTEXT_READ_INFO  "AT+CGCONTRDP=%u"
+#define AT_CMD_PDN_CONTEXT_READ_INFO_PARSE_LINE1 \
+	"+CGCONTRDP: %*u,,\"%*[^\"]\",\"\",\"\",\"%15[0-9.]\",\"%15[0-9.]\",,,,,%u"
+#define AT_CMD_PDN_CONTEXT_READ_INFO_PARSE_LINE2 \
+	"+%*[^+]"\
+	"+CGCONTRDP: %*u,,\"%*[^\"]\",\"\",\"\",\"%39[0-9A-Fa-f:]\",\"%39[0-9A-Fa-f:]\",,,,,%u"
+
+int sm_util_pdn_dynamic_info_get(uint8_t cid, struct sm_pdn_dynamic_info *pdn_info)
+{
+	int ret;
+	char at_cmd_buf[sizeof("AT+CGCONTRDP=###")];
+	char dns_addr_str_primary[NET_INET6_ADDRSTRLEN];
+	char dns_addr_str_secondary[NET_INET6_ADDRSTRLEN];
+	uint32_t mtu = 0;
+
+	if (!pdn_info) {
+		return -EINVAL;
+	}
+
+	/* Reset PDN dynamic info. */
+	memset(pdn_info, 0, sizeof(struct sm_pdn_dynamic_info));
+
+	/* Clear secondary DNS address buffer. */
+	memset(dns_addr_str_secondary, 0, sizeof(dns_addr_str_secondary));
+
+	(void)snprintf(at_cmd_buf, sizeof(at_cmd_buf), AT_CMD_PDN_CONTEXT_READ_INFO, cid);
+	ret = sm_util_at_scanf(at_cmd_buf, AT_CMD_PDN_CONTEXT_READ_INFO_PARSE_LINE1,
+				 dns_addr_str_primary, dns_addr_str_secondary, &mtu);
+	if (ret < 1) {
+		/* Don't log an error if no PDN connections are active, this may not be considered
+		 * an error by the caller.
+		 */
+		if (ret != -NRF_EBADMSG) {
+			LOG_ERR("PDN dynamic info get failed: %d", ret);
+		}
+
+		return ret;
+	}
+
+	pdn_dynamic_info_dns_addr_fill(pdn_info, mtu, dns_addr_str_primary, dns_addr_str_secondary);
+
+	/* Reset secondary DNS address buffer and mtu. */
+	memset(dns_addr_str_secondary, 0, sizeof(dns_addr_str_secondary));
+	mtu = 0;
+
+	/* Scan second line if PDN has dual stack capabilities. */
+	ret = sm_util_at_scanf(at_cmd_buf, AT_CMD_PDN_CONTEXT_READ_INFO_PARSE_LINE2,
+				 dns_addr_str_primary, dns_addr_str_secondary, &mtu);
+	if (ret < 1) {
+		/* We only got one entry, but that is ok. */
+		return 0;
+	}
+
+	pdn_dynamic_info_dns_addr_fill(pdn_info, mtu, dns_addr_str_primary, dns_addr_str_secondary);
+
+	return 0;
+}
+
+int sm_util_cfun_get(void)
+{
+	int ret;
+	int cfun_mode;
+
+	ret = sm_util_at_scanf("AT+CFUN?", "+CFUN: %d", &cfun_mode);
+	if (ret < 0) {
+		LOG_ERR("CFUN mode get failed: %d", ret);
+		return ret;
+	}
+
+	return cfun_mode;
+}
+
+bool sm_util_cfun_is_lte_enabled(void)
+{
+	int cfun_mode = sm_util_cfun_get();
+
+	if (cfun_mode < 0) {
+		return false;
+	}
+
+	return (cfun_mode == LTE_LC_FUNC_MODE_NORMAL || cfun_mode == LTE_LC_FUNC_MODE_ACTIVATE_LTE);
+}
+
+int sm_util_cereg_get(void)
+{
+	int ret;
+	int creg_stat;
+
+	ret = sm_util_at_scanf("AT+CEREG?", "+CEREG: %*d,%d", &creg_stat);
+	if (ret < 0) {
+		LOG_ERR("CEREG status get failed: %d", ret);
+		return ret;
+	}
+
+	return creg_stat;
+}
+
+bool sm_util_cereg_is_registered(void)
+{
+	int creg_stat = sm_util_cereg_get();
+
+	return (creg_stat == 1 || creg_stat == 5);
+}
+
+bool sm_util_is_cid_active(uint8_t cid)
+{
+	int ret;
+	char at_cmd_buf[sizeof("AT+CGPADDR=###")];
+	int active_cid;
+
+	(void)snprintf(at_cmd_buf, sizeof(at_cmd_buf), "AT+CGPADDR=%u", cid);
+	ret = sm_util_at_scanf(at_cmd_buf, "+CGPADDR: %d", &active_cid);
+	if (ret == 1 && active_cid == cid) {
+		return true;
+	}
+
+	return false;
+}
+
+int sm_util_mcuboot_active_slot(void)
+{
+#if FIXED_PARTITION_EXISTS(s1_partition)
+	bool s0_active = false;
+	int err = tfm_platform_s0_active(PARTITION_ADDRESS(s0_partition),
+					 PARTITION_ADDRESS(s1_partition), &s0_active);
+
+	if (err != 0) {
+		LOG_ERR("MCUboot active slot read failed: %d", err);
+		return err;
+	}
+	return s0_active ? 0 : 1;
+#else
+	return -ENOTSUP;
+#endif
+}
+
+int sm_util_mcuboot_active_version(uint32_t *version)
+{
+#if FIXED_PARTITION_EXISTS(s1_partition)
+	bool s0_active = false;
+	int err = tfm_platform_s0_active(PARTITION_ADDRESS(s0_partition),
+					 PARTITION_ADDRESS(s1_partition), &s0_active);
+
+	if (err != 0) {
+		return err;
+	}
+
+	uint32_t addr = s0_active ? PARTITION_ADDRESS(s0_partition)
+				  : PARTITION_ADDRESS(s1_partition);
+	struct fw_info info = {0};
+
+	err = tfm_platform_firmware_info(addr, &info);
+	if (err != 0) {
+		return err;
+	}
+
+	*version = info.version;
+	return 0;
+#else
+	ARG_UNUSED(version);
+	return -ENOTSUP;
+
+#endif
+}

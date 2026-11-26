@@ -1,0 +1,119 @@
+/*
+ * Copyright (c) 2025 Nordic Semiconductor ASA
+ *
+ * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+ */
+
+
+/*
+ * See nRF54L15DK GPIO documentation from
+ * https://docs.nordicsemi.com/bundle/ug_nrf54l15_dk/page/UG/nRF54L15_DK/hw_desription/connector_if.html
+ *
+ * UART0 is used for Serial Modem communication and UART1 is used for console/shell.
+ *
+ * Note: Disable VCOM0 from Board Configurator to release UART0 for Serial Modem.
+ *
+ * UART0 located on the P0 connector is the "uart30" instance in the device tree.
+ * UART1 is "uart20" in the device tree and it is routed to the VCOM1 on the interface chip.
+ * RI and DTR signals are located on P1 connector.
+ */
+
+/ {
+	chosen {
+		/* Switch console to uart20 */
+		zephyr,console = &uart20;
+		zephyr,shell-uart = &uart20;
+	};
+	aliases {
+		modem = &modem;
+	};
+};
+
+/* Zephyr modem UART <-> nRF91 Serial Modem UART */
+&uart30 {
+	status = "okay";
+	current-speed = <115200>;
+	hw-flow-control;
+	zephyr,pm-device-runtime-auto;
+
+	/* Nordic nRF91 Serial Modem configuration */
+	modem: modem {
+		compatible = "nordic,nrf91-sm-v2";
+		status = "okay";
+		mdm-ring-gpios = <&gpio1 12 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+		mdm-dtr-gpios = <&gpio1 11 GPIO_ACTIVE_LOW>;
+		zephyr,pm-device-runtime-auto;
+		cmux-enable-runtime-power-save;
+		cmux-close-pipe-on-power-save;
+		cmux-idle-timeout-ms = <5000>;
+		autostarts;
+	};
+};
+
+&gpio1 {
+	status = "okay";
+};
+
+/* Using default SRAM partitions from nrf54l15_cpuapp_partition.dtsi */
+
+/*
+ * RRAM partition layout for nRF54L15 DK (disable MCUboot)
+ *
+ * 0x0000_0000  slot0 (primary app)          (1492 kB)
+ * 0x0017_5000  Non-secure storage           ( 32 kB)
+ */
+
+/delete-node/ &boot_partition;
+/delete-node/ &slot0_partition;
+/delete-node/ &slot1_partition;
+/delete-node/ &storage_partition;
+
+&cpuapp_rram {
+	partitions {
+		slot0_partition: partition@0 {
+			compatible = "zephyr,mapped-partition";
+			label = "image-0";
+			reg = <0x0 DT_SIZE_K(1492)>;
+		};
+
+		storage_partition: partition@175000 {
+			compatible = "zephyr,mapped-partition";
+			label = "storage";
+			reg = <0x000175000 DT_SIZE_K(32)>;
+		};
+	};
+};
+
+/*
+ * Use external flash for littlefs storage.
+ */
+/ {
+	fstab {
+		compatible = "zephyr,fstab";
+
+		lfs: lfs {
+			compatible = "zephyr,fstab,littlefs";
+			mount-point = "/lfs";
+			partition = <&lfs_part>;
+			automount;
+			read-size = <16>;
+			prog-size = <16>;
+			cache-size = <64>;
+			lookahead-size = <32>;
+			block-cycles = <512>;
+		};
+	};
+};
+
+&mx25r64 {
+	partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		lfs_part: partition@0 {
+			label = "littlefs";
+			reg = <0x00000000 DT_SIZE_M(8)>;
+		};
+	};
+};

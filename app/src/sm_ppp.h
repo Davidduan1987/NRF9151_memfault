@@ -1,0 +1,25 @@
+/*
+ * Copyright (c) 2023 Nordic Semiconductor ASA
+ *
+ * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+ */
+#ifndef SM_PPP_
+#define SM_PPP_
+
+#include <stdbool.h>
+#include <zephyr/modem/pipe.h>
+
+bool sm_ppp_is_stopped(void);
+bool ppp_is_running(void);
+void sm_ppp_set_auto_start(bool enable);
+
+/** Set the permanent modem pipe for PPP communication */
+void sm_ppp_attach(struct modem_pipe *pipe);
+
+/** Detach the modem pipe from PPP communication */
+void sm_ppp_detach(void);
+
+/** Ask to detach from PIPE after disconnecting PPP */
+void sm_ppp_detach_after_disconnect(void);
+
+#endif

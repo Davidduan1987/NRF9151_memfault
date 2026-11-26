@@ -1,0 +1,361 @@
+/*
+ * Copyright (c) 2021 Nordic Semiconductor ASA
+ *
+ * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+ */
+/* strnlen() is a POSIX.1-2008 extension; required explicitly for portable
+ * builds (e.g. native_sim unit tests) where glibc only declares it when
+ * asked for a POSIX feature level >= 200809L.
+ */
+#define _POSIX_C_SOURCE 200809L
+#include <zephyr/logging/log.h>
+#include <zephyr/kernel.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <modem/sms.h>
+#include "sm_util.h"
+#include "sm_at_host.h"
+
+LOG_MODULE_REGISTER(sm_sms, CONFIG_SM_LOG_LEVEL);
+
+#define MAX_CONCATENATED_MESSAGE 10
+#define SM_SMS_AT_HEADER_INFO_MAX_LEN 64
+/* Maximum time to wait for the next part of the concatenated message to be received in minutes */
+#define MAX_CONCATENATED_MESSAGE_AGE K_MINUTES(3)
+
+/**@brief SMS operations. */
+enum sm_sms_operation {
+	AT_SMS_STOP,
+	AT_SMS_START,
+	AT_SMS_SEND
+};
+
+static void sms_concat_cleanup_work_fn(struct k_work *work);
+
+/* Safely append up to max_len bytes of src to buf at *pos, bounding the
+ * write against buf_cap and using memmove() (well-defined even when src
+ * and buf overlap, unlike strcat()/strncat()). *pos is updated to the new
+ * end of the (always NUL-terminated) string in buf.
+ */
+static void sms_concat_append(char *buf, size_t buf_cap, size_t *pos, const char *src,
+			       size_t max_len)
+{
+	size_t len = strnlen(src, max_len);
+
+	if (*pos >= buf_cap - 1) {
+		return;
+	}
+	if (len > buf_cap - 1 - *pos) {
+		len = buf_cap - 1 - *pos;
+	}
+	if (len > 0) {
+		memmove(buf + *pos, src, len);
+	}
+	*pos += len;
+	buf[*pos] = '\0';
+}
+
+struct sm_sms_context {
+	int sms_handle;
+	struct modem_pipe *pipe; /* Pipe requesting SMS service */
+	uint16_t ref_number; /* Reference number in the concatenated message */
+	uint8_t total_msgs; /* Total number of messages in the concatenated message */
+	uint8_t count; /* Current number of messages received in the concatenated message */
+	char *concat_rsp_buf; /* Buffer for the concatenated message */
+	struct k_work_delayable cleanup_work;
+};
+
+static struct sm_sms_context sms_ctx = {
+	.sms_handle = -1,
+	.concat_rsp_buf = NULL,
+	.cleanup_work = Z_WORK_DELAYABLE_INITIALIZER(sms_concat_cleanup_work_fn),
+};
+
+static void sms_concat_clear(struct sm_sms_context *ctx)
+{
+	k_work_cancel_delayable(&ctx->cleanup_work);
+	if (ctx->concat_rsp_buf != NULL) {
+		free(ctx->concat_rsp_buf);
+		ctx->concat_rsp_buf = NULL;
+	}
+	ctx->ref_number = 0;
+	ctx->total_msgs = 0;
+	ctx->count = 0;
+}
+
+static void sms_concat_cleanup_work_fn(struct k_work *work)
+{
+	struct k_work_delayable *dwork = CONTAINER_OF(work, struct k_work_delayable, work);
+	struct sm_sms_context *ctx = CONTAINER_OF(dwork, struct sm_sms_context, cleanup_work);
+
+	LOG_INF("Concat msg timeout ref_number=%u", ctx->ref_number);
+	sms_concat_clear(ctx);
+}
+
+static void sms_concat_handle(struct sms_data *const data)
+{
+	struct sms_deliver_header *header = &data->header.deliver;
+
+	LOG_DBG("Concat msg ref=%d total=%d seq=%d",
+		header->concatenated.ref_number,
+		header->concatenated.total_msgs,
+		header->concatenated.seq_number);
+
+	/* ref_number and total_msgs should remain unchanged.
+	 * If they are different, this is a different concatenated message
+	 * and we discard the current and try with the new message.
+	 * We may end up in changing from one message to another one if two
+	 * concatenated messages are received at the same time in mixed order.
+	 * A reference number of 0 is valid in the UDH.
+	 */
+	if (sms_ctx.concat_rsp_buf != NULL &&
+	    sms_ctx.ref_number != header->concatenated.ref_number) {
+		LOG_ERR("Concat msg ref mismatch stored=%d received=%d",
+			sms_ctx.ref_number, header->concatenated.ref_number);
+		sms_concat_clear(&sms_ctx);
+	}
+	/* Staging buffer layout: [0, SM_SMS_AT_HEADER_INFO_MAX_LEN) holds the
+	 * header text only (date/address prefix); each message part i
+	 * (1-based) is staged in its own fixed-size slot at
+	 * SM_SMS_AT_HEADER_INFO_MAX_LEN + (i-1) * SMS_MAX_PAYLOAD_LEN_CHARS,
+	 * independent of arrival order. One extra byte of slack is
+	 * allocated so the final compaction pass (see below) can never
+	 * write one byte past the end of the buffer.
+	 */
+	size_t concat_msg_len = SM_SMS_AT_HEADER_INFO_MAX_LEN +
+		(size_t)SMS_MAX_PAYLOAD_LEN_CHARS * header->concatenated.total_msgs + 1;
+
+	if (sms_ctx.concat_rsp_buf == NULL) {
+		sms_ctx.ref_number = header->concatenated.ref_number;
+
+		if (header->concatenated.total_msgs > MAX_CONCATENATED_MESSAGE) {
+			LOG_WRN("Ignoring concat msg parts=%d max=%d",
+				header->concatenated.total_msgs, MAX_CONCATENATED_MESSAGE);
+			goto done;
+		}
+
+		/* Allocate buffer for concatenated message. The allocation
+		 * size is an upper boundary as headers and last message part
+		 * are slightly less in practice.
+		 */
+		sms_ctx.concat_rsp_buf = calloc(1, concat_msg_len);
+		if (sms_ctx.concat_rsp_buf == NULL) {
+			LOG_ERR("Concat msg alloc failed size=%zu parts=%d",
+				concat_msg_len, header->concatenated.total_msgs);
+			goto done;
+		}
+	}
+	if (sms_ctx.total_msgs == 0) {
+		sms_ctx.total_msgs = header->concatenated.total_msgs;
+	}
+	if (sms_ctx.total_msgs != header->concatenated.total_msgs) {
+		LOG_ERR("Concat msg total mismatch stored=%d received=%d",
+			sms_ctx.total_msgs, header->concatenated.total_msgs);
+		goto done;
+	}
+	/* seq_number should start with 1 but could arrive in random order */
+	if (header->concatenated.seq_number == 0 ||
+	    header->concatenated.seq_number > sms_ctx.total_msgs) {
+		LOG_ERR("Concat msg invalid seq=%d total=%d",
+			header->concatenated.seq_number, sms_ctx.total_msgs);
+		goto done;
+	}
+	if (header->concatenated.seq_number == 1) {
+		/* Header text only - the payload is staged separately below,
+		 * in its own slot, so it can never overrun into part 2's slot.
+		 * Truncation here (if the header text would exceed
+		 * SM_SMS_AT_HEADER_INFO_MAX_LEN) is intentional and safe:
+		 * snprintf() always NUL-terminates within bounds.
+		 */
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+#endif
+		snprintf(sms_ctx.concat_rsp_buf,
+			SM_SMS_AT_HEADER_INFO_MAX_LEN,
+			"\r\n#XSMS: \"%02d-%02d-%02d %02d:%02d:%02d "
+			"UTC%+03d:%02d\",\"%s\",\"",
+			header->time.year, header->time.month, header->time.day,
+			header->time.hour, header->time.minute, header->time.second,
+			header->time.timezone * 15 / 60,
+			abs(header->time.timezone) * 15 % 60,
+			header->originating_address.address_str);
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
+	}
+	{
+		/* Copy at most SMS_MAX_PAYLOAD_LEN_CHARS bytes into this part's
+		 * fixed-size slot. A plain snprintf("%s", ...) would write a
+		 * terminating NUL after a full-length (160-byte) payload,
+		 * overrunning by one byte into the next part's slot -- benign
+		 * only if that neighboring slot is written afterward. Using
+		 * memcpy() with the payload's actual length avoids writing
+		 * past the slot regardless of arrival order.
+		 */
+		char *slot = sms_ctx.concat_rsp_buf + SM_SMS_AT_HEADER_INFO_MAX_LEN +
+			     (header->concatenated.seq_number - 1) * SMS_MAX_PAYLOAD_LEN_CHARS;
+		size_t len = (data->payload_len > 0 &&
+			      data->payload_len < SMS_MAX_PAYLOAD_LEN_CHARS)
+				? (size_t)data->payload_len
+				: SMS_MAX_PAYLOAD_LEN_CHARS;
+
+		memcpy(slot, data->payload, len);
+	}
+	sms_ctx.count++;
+	if (sms_ctx.count == sms_ctx.total_msgs) {
+		/* Compact the header + all message-part slots into a single,
+		 * contiguous string at the front of the buffer. memmove() is
+		 * used (instead of strcat()/strncat()) because source and
+		 * destination regions can legitimately overlap once the
+		 * write cursor catches up with a slot's own storage.
+		 */
+		size_t pos = strnlen(sms_ctx.concat_rsp_buf, SM_SMS_AT_HEADER_INFO_MAX_LEN - 1);
+
+		for (int i = 0; i < sms_ctx.total_msgs; i++) {
+			char *slot = sms_ctx.concat_rsp_buf + SM_SMS_AT_HEADER_INFO_MAX_LEN +
+				     i * SMS_MAX_PAYLOAD_LEN_CHARS;
+
+			sms_concat_append(sms_ctx.concat_rsp_buf, concat_msg_len, &pos, slot,
+					   SMS_MAX_PAYLOAD_LEN_CHARS);
+		}
+		sms_concat_append(sms_ctx.concat_rsp_buf, concat_msg_len, &pos, "\"\r\n", 3);
+		/* urc_send_to() queues the message and sends it from sm_work_q. data_send()
+		 * would send it here, blocking the system work queue that drains the pipe.
+		 */
+		urc_send_to(sms_ctx.pipe, "%s", sms_ctx.concat_rsp_buf);
+	} else {
+		/* If new messages for the concatenated message are not received
+		 * within 3 minutes, discard the concatenated message.
+		 */
+		(void)k_work_reschedule(&sms_ctx.cleanup_work, MAX_CONCATENATED_MESSAGE_AGE);
+		return;
+	}
+done:
+	sms_concat_clear(&sms_ctx);
+}
+
+STATIC void sms_callback(struct sms_data *const data, void *context)
+{
+	ARG_UNUSED(context);
+
+	if (data == NULL) {
+		return;
+	}
+
+	if (data->type == SMS_TYPE_DELIVER) {
+		struct sms_deliver_header *header = &data->header.deliver;
+
+		if (!header->concatenated.present) {
+			urc_send_to(sms_ctx.pipe,
+				"\r\n#XSMS: \"%02d-%02d-%02d %02d:%02d:%02d UTC%+03d:%02d\",\""
+				"%s\",\"%s\"\r\n",
+				header->time.year, header->time.month, header->time.day,
+				header->time.hour, header->time.minute, header->time.second,
+				header->time.timezone * 15 / 60,
+				abs(header->time.timezone) * 15 % 60,
+				header->originating_address.address_str, data->payload);
+		} else {
+			sms_concat_handle(data);
+		}
+	} else {
+		LOG_WRN("Unknown SMS type: %d", data->type);
+	}
+}
+
+static int do_sms_start(void)
+{
+	int err = 0;
+
+	if (sms_ctx.sms_handle >= 0) {
+		/* already registered */
+		return -EBUSY;
+	}
+
+	sms_ctx.sms_handle = sms_register_listener(sms_callback, NULL);
+	if (sms_ctx.sms_handle < 0) {
+		err = sms_ctx.sms_handle;
+		LOG_ERR("SMS register failed: %d", err);
+		sms_ctx.sms_handle = -1;
+	}
+
+	return err;
+}
+
+static int do_sms_stop(void)
+{
+	sms_unregister_listener(sms_ctx.sms_handle);
+	sms_ctx.sms_handle = -1;
+	sms_concat_clear(&sms_ctx);
+
+	return 0;
+}
+
+static int do_sms_send(const char *number, const char *message, uint16_t message_len)
+{
+	int err;
+
+	if (sms_ctx.sms_handle < 0) {
+		LOG_ERR("Not registered");
+		return -EPERM;
+	}
+
+	err = sms_send(number, message, message_len, SMS_DATA_TYPE_ASCII);
+	if (err) {
+		LOG_ERR("SMS send failed: %d", err);
+	}
+
+	return err;
+}
+
+SM_AT_CMD_CUSTOM(xsms, "AT#XSMS", handle_at_sms);
+STATIC int handle_at_sms(enum at_parser_cmd_type cmd_type, struct at_parser *parser, uint32_t)
+{
+	int err = -EINVAL;
+	uint16_t op;
+
+	switch (cmd_type) {
+	case AT_PARSER_CMD_TYPE_SET:
+		err = at_parser_num_get(parser, 1, &op);
+		if (err) {
+			return err;
+		}
+		if (op == AT_SMS_STOP) {
+			err = do_sms_stop();
+		} else if (op == AT_SMS_START) {
+			sms_ctx.pipe = sm_at_host_get_current_pipe();
+			err = do_sms_start();
+		} else if (op ==  AT_SMS_SEND) {
+			char number[SMS_MAX_ADDRESS_LEN_CHARS + 1];
+			const char *msg_ptr = NULL;
+			int size;
+
+			size = SMS_MAX_ADDRESS_LEN_CHARS + 1;
+			err = util_string_get(parser, 2, number, &size);
+			if (err) {
+				return err;
+			}
+			err = at_parser_string_ptr_get(parser, 3, &msg_ptr, &size);
+			if (err) {
+				return err;
+			}
+			err = do_sms_send(number, msg_ptr, size);
+		} else {
+			LOG_WRN("Unknown operation: %d", op);
+			err = -EINVAL;
+		}
+		break;
+
+	case AT_PARSER_CMD_TYPE_TEST:
+		rsp_send("\r\n#XSMS: (%d,%d,%d),<number>,<message>\r\n",
+			AT_SMS_STOP, AT_SMS_START, AT_SMS_SEND);
+		err = 0;
+		break;
+
+	default:
+		break;
+	}
+
+	return err;
+}

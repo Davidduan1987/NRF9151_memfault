@@ -1,0 +1,248 @@
+/*
+ * Copyright (c) 2024 Nordic Semiconductor ASA
+ *
+ * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+ */
+
+/ {
+	chosen {
+		ncs,sm-uart = &dtr_uart0;
+		zephyr,console = &uart1;
+		zephyr,settings_partition = &settings_storage_partition;
+		nordic,memfault-coredump-partition = &memfault_coredump_partition;
+	};
+};
+
+/* DTR with DK */
+&uart0 {
+	status = "okay";
+	hw-flow-control;
+
+	dtr_uart0: dtr-uart {
+		compatible = "nordic,dtr-uart";
+		dtr-gpios = <&gpio0 8 (GPIO_PULL_UP | GPIO_ACTIVE_HIGH)>;
+		ri-gpios = <&gpio0 0 GPIO_ACTIVE_LOW>;
+		status = "okay";
+	};
+	pinctrl-0 = <&uart0_default_alt>;
+	pinctrl-1 = <&uart0_sleep_alt>;
+	pinctrl-names = "default", "sleep";
+
+};
+
+&gpio0 {
+	status = "okay";
+	/* Use PORT event for DTR (8) pin to save power */
+	sense-edge-mask = <BIT(8)>;
+};
+
+
+&pinctrl {
+	uart0_default_alt: uart0_default_alt {
+		group1 {
+			psels = <NRF_PSEL(UART_RX, 0, 26)>;
+			bias-pull-up;
+		};
+		group2 {
+			psels = <NRF_PSEL(UART_CTS, 0, 15)>;
+			bias-pull-up;
+		};
+		group3 {
+			psels = <NRF_PSEL(UART_TX, 0, 27)>,
+				<NRF_PSEL(UART_RTS, 0, 14)>;
+		};
+	};
+
+	uart0_sleep_alt: uart0_sleep_alt {
+		group1 {
+			psels = <NRF_PSEL(UART_TX, 0, 27)>,
+				<NRF_PSEL(UART_RX, 0, 26)>,
+				<NRF_PSEL(UART_RTS, 0, 14)>,
+				<NRF_PSEL(UART_CTS, 0, 15)>;
+			low-power-enable;
+		};
+	};
+};
+
+/* Disable I2C2.
+ * - Enabling IO expander causes ~20uA to be consumed while DTR is deasserted.
+ * - We use P0.31 and P0.30 pins for DTR and RI signals with external MCU.
+ */
+&i2c2 {
+	status = "disabled";
+};
+
+/* Enable UART1 as the shared backend for Zephyr logs and modem traces (VCOM1 on the DK).
+ * Modem traces require 1 000 000 baud. Hardware flow control is not used.
+ */
+&uart1 {
+	status = "okay";
+	current-speed = <1000000>;
+};
+
+/*
+ * Flash partition layout for nRF9151 DK (same with B0, MCUboot and application):
+ *
+ * 0x0000_0000  b0 (NSIB)                    ( 32 kB)
+ * 0x0000_8000  s0 (MCUBoot image, slot 0)   ( 48 kB)
+ * 0x0001_4000  s1 (MCUBoot image, slot 1)   ( 48 kB)
+ * 0x0002_0000  slot0 (primary app)          (440 kB)
+ *   0x0002_0000  TF-M secure                ( 32 kB)
+ *   0x0002_8000  Application (non-secure)   (408 kB - (MCUBoot swap sector + MCUboot trailer))
+ * 0x0008_e000  slot1 (secondary app)        (436 kB)
+ * 0x000f_b000  storage (container)          ( 20 kB)
+ *   0x000f_b000  Memfault core dump         ( 12 kB)
+ *   0x000f_e000  Non-secure storage         (  8 kB)
+ */
+
+/delete-node/ &boot_partition;
+/delete-node/ &slot0_partition;
+/delete-node/ &slot1_partition;
+/delete-node/ &tfm_ps_partition;
+/delete-node/ &tfm_its_partition;
+/delete-node/ &tfm_otp_partition;
+/delete-node/ &storage_partition;
+
+&flash0 {
+	partitions {
+		b0_partition: partition@0 {
+			compatible = "zephyr,mapped-partition";
+			label = "b0";
+			reg = <0x0 0x8000>;
+		};
+
+		s0_partition: boot_partition: partition@8000 {
+			compatible = "zephyr,mapped-partition";
+			label = "mcuboot-0";
+			reg = <0x8000 0xc000>;
+		};
+
+		s1_partition: partition@14000 {
+			compatible = "zephyr,mapped-partition";
+			label = "mcuboot-1";
+			reg = <0x14000 0xc000>;
+		};
+
+		slot0_partition: partition@20000 {
+			compatible = "zephyr,mapped-partition";
+			label = "image-0";
+			reg = <0x20000 0x6e000>;
+			ranges = <0x0 0x20000 0x6e000>;
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			slot0_s_partition: partition@0 {
+				compatible = "zephyr,mapped-partition";
+				label = "image-0-secure";
+				reg = <0x0 0x8000>;
+			};
+
+			slot0_ns_partition: partition@8000 {
+				compatible = "zephyr,mapped-partition";
+				label = "image-0-nonsecure";
+				reg = <0x8000 0x66000>;
+			};
+		};
+
+		slot1_partition: partition@8e000 {
+			compatible = "zephyr,mapped-partition";
+			label = "image-1";
+			reg = <0x8e000 0x6d000>;
+			ranges = <0x0 0x8e000 0x6d000>;
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			slot1_s_partition: partition@0 {
+				compatible = "zephyr,mapped-partition";
+				label = "image-1-secure";
+				reg = <0x0 0x8000>;
+			};
+
+			slot1_ns_partition: partition@8000 {
+				compatible = "zephyr,mapped-partition";
+				label = "image-1-nonsecure";
+				reg = <0x8000 0x65000>;
+			};
+		};
+
+		storage_partition: partition@fb000 {
+			compatible = "zephyr,mapped-partition";
+			label = "nonsecure-storage";
+			reg = <0xfb000 0x5000>;
+			ranges = <0x0 0xfb000 0x5000>;
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			memfault_coredump_partition: partition@0 {
+				compatible = "zephyr,mapped-partition";
+				label = "memfault_coredump_partition";
+				reg = <0x0 0x3000>;
+			};
+
+			settings_storage_partition: partition@3000 {
+				compatible = "zephyr,mapped-partition";
+				label = "settings-storage";
+				reg = <0x3000 0x2000>;
+			};
+		};
+	};
+};
+
+/*
+ * Application SRAM layout for nRF9151 DK:
+ *
+ * 0x2000_0000  Secure RAM                   (  16 kB)
+ * 0x2000_4000  Non-secure RAM area          ( 240 kB)
+ *   0x2000_4000  Modem shared area          (  31 kB)
+ *     0x2000_4000  control                  (1832 B)
+ *     0x2000_4728  app -> cell              (21720 B)
+ *     0x2000_9c00  cell -> app              (   8 kB)
+ *   0x2000_bc00  Application RAM            ( 209 kB)
+ */
+
+/delete-node/ &sram0_s;
+/delete-node/ &sram0_ns;
+
+&sram0 {
+
+	sram0_s: sram@0 {
+		reg = <0x0 0x4000>;
+	};
+
+	sram0_ns: sram@4000 {
+		reg = <0x4000 0x3c000>;
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges = <0x0 0x4000 0x3c000>;
+
+		/* Must be in first 128 kB of RAM. */
+		sram0_ns_modem: sram0_ns@0 {
+			/* Modem (shared) memory */
+			reg = <0x0 0x7c00>;
+			#address-cells = <1>;
+			#size-cells = <1>;
+			ranges = <0x0 0x0 0x7c00>;
+
+			cpuapp_cpucell_ipc_shm_ctrl: sram0_ns_modem@0 {
+				/* Modem IPC control */
+				reg = <0x0 0x728>;
+			};
+
+			cpuapp_cpucell_ipc_shm_heap: sram0_ns_modem@728 {
+				/* Modem IPC transmit */
+				reg = <0x728 0x54d8>;
+			};
+
+			cpucell_cpuapp_ipc_shm_heap: sram0_ns_modem@5c00 {
+				/* Modem IPC receive */
+				reg = <0x5c00 0x2000>;
+			};
+
+		};
+
+		sram0_ns_app: sram0_ns@7c00 {
+			/* Non-Secure application memory */
+			reg = <0x7c00 0x34400>;
+		};
+	};
+};

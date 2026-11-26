@@ -1,0 +1,24 @@
+/ {
+	chosen {
+		ncs,sm-uart = &uart0;
+	};
+};
+
+&dtr_uart0 {
+	status = "disabled";
+};
+
+&gd25wb256 {
+	status = "okay";
+
+	partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		modem_trace: partition@0 {
+			label = "modem_trace";
+			reg = <0x0 0xff000>;
+		};
+	};
+};
