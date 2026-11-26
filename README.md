@@ -28,7 +28,45 @@
 
 ## 准备和编译
 
-### 方式一：在现有 workspace 中使用
+### 方式一：使用 VS Code 图形界面
+
+1. 在 VS Code 安装 **nRF Connect for VS Code Extension Pack**。先准备好下文所述的 west workspace 和依赖；仅下载本仓库而没有 NCS 和 west 模块无法编译。
+2. 打开 nRF Connect 扩展，在 **Applications** 视图选择 **Add an existing application**，选择本仓库的 `app` 目录，**不是**仓库根目录。当前电脑的示例路径为：
+
+   ```text
+   C:\ncs\ncs-serial-modem\modem_nrf91\serial_modem_91\NRF9151_memfault\app
+   ```
+
+3. 点击应用下的 **Add build configuration**，按以下内容配置：
+   - **SDK**：选择该 west workspace 使用的 NCS v3.4.1；当前已验证的 workspace 为 `C:\ncs\ncs-serial-modem`。不要误选 `C:\ncs\v3.3.0`。
+   - **Toolchain**：选择已安装的 v3.4.0 工具链；本机已验证路径为 `C:\ncs\toolchains\dcbdc366a1`。若扩展自动识别 workspace，确认其实际 SDK 路径和工具链即可。
+   - **Board target**：选择 `nrf9151dk/nrf9151/ns`。
+   - **Sysbuild**：选择启用；不同版本界面可能显示为 **Use sysbuild**。
+   - **Build directory name**：例如 `build-nrf9151-memfault`。Windows 下建议使用较短的路径，避免路径过长。
+   - 保留默认基础配置和基础 devicetree overlay；不要把下面的附加文件设置为基础文件。
+4. 在 **Extra CMake arguments** 中使用 **Add Argument** 分别添加两项，直接输入以下内容，**无需加引号或 `--`**：
+
+   ```text
+   -Dapp_EXTRA_CONF_FILE=nrf-device-provisioning.conf;pc-trace.conf
+   -Dapp_EXTRA_DTC_OVERLAY_FILE=trace-backend-nrf9151.overlay;pc-trace-nrf9151.overlay
+   ```
+
+   两项中的分号分别连接两个文件，`app_` 是 sysbuild 应用域前缀。不要再在 Extra Kconfig fragments 或 Extra Devicetree overlays 中重复选择同一批文件。若扩展界面提供应用域专属配置字段，也必须确认最终生成的是上述 `app_` 参数。
+5. 不勾选 **Generate only**，点击 **Generate and Build**；之后可在 **Actions** 中点击 **Build** 重新编译。更换板子、SDK 或配置片段时，新建构建配置或使用 **Pristine Build** 清理后重新生成；清理前确认所选构建目录正确。
+6. 编译成功后，打开所选构建目录的 `app\zephyr\.config`，核对至少包含：
+
+   ```text
+   CONFIG_NRF_PROVISIONING=y
+   CONFIG_SM_PC_MODEM_TRACE_UPLOAD=y
+   CONFIG_NRF_MODEM_LIB_TRACE_BACKEND_FLASH=y
+   CONFIG_SM_NRF_CLOUD_FOTA=y
+   ```
+
+   OTA 镜像和符号文件的位置见下文。若扩展未识别自定义 workspace，先在 **Manage SDKs > Manage West Workspace** 中检查 workspace；切勿改用另一个版本的 SDK 后直接假定功能一致。
+
+上面图形界面的字段和参数依据 Nordic 扩展说明及当前安装的扩展格式整理；本工程已用等效 west 命令编译通过，尚未逐项通过图形界面验证。
+
+### 方式二：在现有 workspace 中使用命令行
 
 先准备包含 NCS v3.4.1 和匹配 Serial Modem 上游模块的 west workspace；本工程应使用与 `west.yml` 一致的依赖，不要直接使用其他版本的 NCS workspace。以下是当前 Windows 环境的示例路径，按实际位置修改：
 
@@ -39,7 +77,7 @@ nrfutil sdk-manager toolchain launch --ncs-version v3.4.0 -- west build --sysbui
 
 使用 sysbuild 时必须保留 `app_` 前缀及上述两个配置片段、两个 devicetree overlay，否则不是本说明对应的功能组合。
 
-### 方式二：将本仓库作为 west manifest
+### 方式三：将本仓库作为 west manifest
 
 仓库发布后，可以用其 `west.yml` 创建新的独立 workspace，并按安装环境选择工具链：
 
